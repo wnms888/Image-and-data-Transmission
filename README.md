@@ -10,6 +10,8 @@ EmbedCode/
 HostApp/
   monitor.py               可缩放图形化上位机
   protocol.py              IMGT v1 分帧、校验、RGB565 解码和 PNG 编码
+  oscilloscope.py          通过校验的数值日志多通道示波器
+  image_processing.py      逆透视与红黄 HSL 检测实时预览
   receiver.py              TCP 监听/客户端、串口接收
   frame_saver.py           后台 PNG 单帧/连续帧保存
   启动上位机.bat           Windows 推荐启动入口
@@ -44,6 +46,8 @@ New-NetFirewallRule -DisplayName "TC4 WiFi Assistant TCP 8086" `
 
 ### `wifi TCP fail` 排查
 
+#### 首先尝试开启上位机侦听再对嵌入式端进行初始化
+
 当前电脑已经验证 `192.168.137.1:8086` 的本机 TCP 连通性；若开发板仍显示 `wifi TCP fail`，优先检查 Windows 防火墙。执行下面命令：
 
 ```powershell
@@ -68,6 +72,15 @@ netsh advfirewall show currentprofile
 
 “保存当前帧”将当前画面异步保存为 PNG。“开始保存全部帧”后，每个接收图像帧均保存为 PNG；再次点击“结束保存全部帧”后停止接收新帧，已排队帧会继续写入。文件位于 `HostApp/captured_frames/`。
 
+“分级调试信息”中的“示波器”页默认关闭。启用后，数值日志会按接收时间绘制：横轴是时间、纵轴是幅值，各通道使用不同颜色。IMGT 模式只会将已通过包头和载荷校验的数据送入日志/示波器；原始 Printf 文本模式没有数据包校验。可用“放大”“缩小”调整时间与幅值视图，“自动缩放”恢复按数据范围缩放，“清除”删除已采样曲线。无数值的文字日志不会产生曲线。
+
+将鼠标悬停在曲线采样点附近可查看相对时间和各通道数值；在示波器图内滚动滚轮可直接放大或缩小时间与幅值视图。
+
+“实时图像”面板还提供两个不影响原始接收/保存图像的上位机处理页：
+
+- **逆透视**：按 `CameraIPM.h` 的相机内参、畸变参数和单应矩阵生成俯视预览；可调近端/远端 X、横向半宽和输出尺寸，并同时查看原图与结果。
+- **颜色检测**：按 `ColorDetection.c` 的 HSL 0–240、红黄阈值、ROI 和四连通面积过滤生成实时检测掩码；可图形化修改各项参数，并同时查看原图与结果。
+
 ## 颜色异常排查
 
 若图像轮廓正确但颜色异常，传输长度与图像分帧通常是正确的，问题一般是 RGB565 每像素两字节的顺序或红蓝通道解释不一致。
@@ -82,13 +95,21 @@ netsh advfirewall show currentprofile
 
 ## Printf 重定向
 
-在嵌入式工程已有的 `fputc` 或 `_write` 中镜像输出到 WiFi：
+当前嵌入式实现使用非阻塞日志 FIFO：`printf` 重定向只入队，主循环中的 `WifiImageTransfer_Service()` 再发送一个 SPI 分片。因此不要在重定向函数中直接调用 WiFi/SPI 发送函数。
+
+在项目已有的 TriCore GCC `write()` 重定向（通常位于 `zf_common_debug.c`）中调用：
 
 ```c
-WifiImageTransfer_PutChar((char)ch);
+WifiImageTransfer_WriteLogBytes(data, (uint32)length);
 ```
 
-普通代码无需修改：
+并在 CPU0 的每次主循环中调用服务函数（即使本次没有提交图像也要调用）：
+
+```c
+WifiImageTransfer_Service();
+```
+
+若工程使用字符级 `fputc`，可改为调用 `WifiImageTransfer_PutChar((char)ch)`。应用层的 `printf` 无需修改：
 
 ```c
 printf("[info] Base_StartWaitingIMU\n");
@@ -96,11 +117,11 @@ printf("speed: %d\n", 666);
 printf("[warning] channel_data: %d, %d, %d, %d\n", 12, 13, 14, 15);
 ```
 
-文本按换行封装；`[error]`、`[warning]`、`[info]` 分别显示在三个独立文本框。省略等级时默认 `info`。
+日志 FIFO 数组默认 1024 字节（环形队列保留一个空位，实际可排队 1023 字节），单个文本包的安全上限默认 256 字节；服务函数在 `\n` 或达到该上限时封包。`[error]`、`[warning]`、`[info]` 分别显示在三个独立文本框；省略等级时默认 `info`。FIFO 满时会丢弃最新日志字节而不会影响图像传输。
 
 ## 数据帧
 
-IMGT v1 使用固定 22 字节小端头：`AA 55`、版本、类型、载荷长度、宽高、像素格式、标志、序号、头 CRC-16、可选载荷 CRC-32。类型 `1` 为 RGB565 图像，类型 `2` 为 UTF-8/ASCII Printf 文本。完整字段说明见 [HostApp/README.zh-CN.md](HostApp/README.zh-CN.md)。
+IMGT v1 使用固定 22 字节小端头：`AA 55`、版本、类型、载荷长度、宽高、像素格式、标志、序号、头 CRC-16、载荷 CRC-32。类型 `1` 为 RGB565 图像，类型 `2` 为 UTF-8/ASCII Printf 文本。标志 bit 1 说明载荷 CRC 是否存在；嵌入式端与上位机默认都要求该标志和 CRC-32。头 CRC、载荷 CRC 失败或 CRC 标志缺失的完整包会直接丢弃，绝不会显示为图像、文本日志或示波器曲线。完整字段说明见 [HostApp/README.zh-CN.md](HostApp/README.zh-CN.md)。
 
 ## 验证
 
@@ -109,4 +130,4 @@ Set-Location HostApp
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖 TCP 分片重组、CRC/重同步、Printf 格式、RGB565 高低字节解码、等比缩放、PNG 保存和串口描述展示。
+测试覆盖 TCP 分片重组、CRC/重同步与缺失 CRC 丢弃、Printf 格式、示波器数据模型、RGB565 高低字节解码、逆透视/颜色检测模型、等比缩放、PNG 保存和串口描述展示。

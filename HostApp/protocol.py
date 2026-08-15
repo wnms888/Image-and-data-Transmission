@@ -22,6 +22,10 @@ HEADER_SIZE = 22
 MAX_PAYLOAD_SIZE = 4 * 1024 * 1024
 MAX_TEXT_PAYLOAD_SIZE = 64 * 1024
 PIXEL_FLAG_RGB565_MSB_FIRST = 0x01
+PACKET_FLAG_PAYLOAD_CRC_PRESENT = 0x02
+# Keep in lockstep with WIFI_IMAGE_TRANSFER_ENABLE_PAYLOAD_CRC.  Only packets
+# that satisfy this requirement are returned to the GUI.
+PAYLOAD_CRC_REQUIRED = True
 
 PIXEL_LAYOUT_AUTO = "auto"
 PIXEL_LAYOUT_RGB565_MSB = "rgb565_msb"
@@ -77,10 +81,12 @@ def encode_packet(
     height: int = 0,
     pixel_format: int = 0,
     flags: int = 0,
-    include_payload_crc: bool = False,
+    include_payload_crc: bool = True,
 ) -> bytes:
     """Build a packet for tests, replay tooling, or compatible senders."""
 
+    if include_payload_crc:
+        flags |= PACKET_FLAG_PAYLOAD_CRC_PRESENT
     prefix = struct.pack(
         "<2sBBIHHBBH",
         MAGIC,
@@ -99,13 +105,20 @@ def encode_packet(
 
 
 class StreamParser:
-    """Incremental binary parser that resynchronizes after corrupt bytes."""
+    """Incremental binary parser that returns only structurally valid packets.
 
-    def __init__(self) -> None:
+    Header-CRC failures, malformed headers, missing required payload CRCs, and
+    payload-CRC mismatches are counted and discarded before the caller can
+    render an image, append a log entry, or feed the oscilloscope.
+    """
+
+    def __init__(self, require_payload_crc: bool = PAYLOAD_CRC_REQUIRED) -> None:
         self._buffer = bytearray()
+        self.require_payload_crc = require_payload_crc
         self.dropped_bytes = 0
         self.header_crc_errors = 0
         self.payload_crc_errors = 0
+        self.missing_payload_crc_errors = 0
         self.invalid_packets = 0
 
     def reset(self) -> None:
@@ -113,6 +126,7 @@ class StreamParser:
         self.dropped_bytes = 0
         self.header_crc_errors = 0
         self.payload_crc_errors = 0
+        self.missing_payload_crc_errors = 0
         self.invalid_packets = 0
 
     def feed(self, incoming: bytes) -> list[Packet]:
@@ -174,7 +188,12 @@ class StreamParser:
 
             payload = bytes(self._buffer[HEADER_SIZE:total_length])
             del self._buffer[:total_length]
-            if payload_crc and (zlib.crc32(payload) & 0xFFFFFFFF) != payload_crc:
+            if self.require_payload_crc and not flags & PACKET_FLAG_PAYLOAD_CRC_PRESENT:
+                self.missing_payload_crc_errors += 1
+                continue
+            if flags & PACKET_FLAG_PAYLOAD_CRC_PRESENT and (
+                zlib.crc32(payload) & 0xFFFFFFFF
+            ) != payload_crc:
                 self.payload_crc_errors += 1
                 continue
 

@@ -11,6 +11,8 @@ from time import perf_counter
 from tkinter import messagebox, ttk
 
 from frame_saver import FrameSaveWorker
+from image_processing import ColourDetectionPane, IpmPane
+from oscilloscope import OscilloscopePane
 from protocol import (
     PACKET_IMAGE_RGB565,
     PACKET_TEXT,
@@ -110,6 +112,7 @@ class ImageTransmissionApp:
         self._source_rgb_key: tuple[int, str, int] | None = None
         self._resize_render_pending = False
         self._preview_dirty = False
+        self._processing_refresh_pending = False
         self._frame_times: deque[float] = deque()
         self.frame_rate = 0.0
         self.lost_packet_count = 0
@@ -159,6 +162,19 @@ class ImageTransmissionApp:
             padding=6,
         )
         style.configure(
+            "Input.TSpinbox",
+            fieldbackground="#172554",
+            background="#172554",
+            foreground="#f8fafc",
+            arrowcolor="#bfdbfe",
+            padding=4,
+        )
+        style.map(
+            "Input.TSpinbox",
+            fieldbackground=[("readonly", "#172554"), ("disabled", "#1e293b")],
+            foreground=[("disabled", "#94a3b8")],
+        )
+        style.configure(
             "Input.TCombobox",
             fieldbackground="#172554",
             background="#172554",
@@ -173,6 +189,25 @@ class ImageTransmissionApp:
             foreground=[("readonly", "#f8fafc"), ("disabled", "#94a3b8")],
             selectbackground=[("readonly", "#1d4ed8")],
             selectforeground=[("readonly", "#ffffff")],
+        )
+        style.configure("TNotebook", background="#111c31", borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            background="#172554",
+            foreground="#bfdbfe",
+            padding=(12, 6),
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#2563eb"), ("active", "#1e3a8a")],
+            foreground=[("selected", "#ffffff")],
+        )
+        style.configure("TCheckbutton", background="#111c31", foreground="#dbeafe")
+        style.map(
+            "TCheckbutton",
+            background=[("active", "#111c31")],
+            foreground=[("disabled", "#64748b")],
         )
         style.configure("Connected.TLabel", foreground="#5eead4", font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("Disconnected.TLabel", foreground="#fbbf24", font=("Microsoft YaHei UI", 10, "bold"))
@@ -257,15 +292,32 @@ class ImageTransmissionApp:
         image_card.columnconfigure(0, weight=1)
         image_card.rowconfigure(1, weight=1)
         ttk.Label(image_card, textvariable=self.image_info_var, foreground="#93c5fd").grid(row=0, column=0, sticky="w", pady=(0, 8))
-        self.canvas = tk.Canvas(image_card, background="#06101f", highlightthickness=0)
-        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.image_notebook = ttk.Notebook(image_card)
+        self.image_notebook.grid(row=1, column=0, sticky="nsew")
+        live_tab = ttk.Frame(self.image_notebook, style="Card.TFrame")
+        live_tab.columnconfigure(0, weight=1)
+        live_tab.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(live_tab, background="#06101f", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
+        self.image_notebook.add(live_tab, text="实时图像")
+        self.ipm_pane = IpmPane(self.image_notebook, self._request_processing_refresh)
+        self.image_notebook.add(self.ipm_pane, text="逆透视")
+        self.colour_pane = ColourDetectionPane(self.image_notebook, self._request_processing_refresh)
+        self.image_notebook.add(self.colour_pane, text="颜色检测")
+        self.image_notebook.bind("<<NotebookTabChanged>>", self._on_image_tab_changed)
         main.add(image_card, weight=3)
 
         log_card = ttk.LabelFrame(main, text=" 分级调试信息 ", padding=(2, 2))
         log_card.columnconfigure(0, weight=1)
         log_card.rowconfigure(0, weight=1)
-        log_split = ttk.PanedWindow(log_card, orient="vertical")
+        self.debug_notebook = ttk.Notebook(log_card)
+        self.debug_notebook.grid(row=0, column=0, sticky="nsew")
+
+        log_tab = ttk.Frame(self.debug_notebook, style="Card.TFrame")
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(0, weight=1)
+        log_split = ttk.PanedWindow(log_tab, orient="vertical")
         log_split.grid(row=0, column=0, sticky="nsew")
         self.log_panes = {
             "info": LogPane(log_split, "INFO", "#5eead4"),
@@ -274,6 +326,9 @@ class ImageTransmissionApp:
         }
         for level in ("info", "warning", "error"):
             log_split.add(self.log_panes[level], weight=1)
+        self.debug_notebook.add(log_tab, text="分级日志")
+        self.scope = OscilloscopePane(self.debug_notebook)
+        self.debug_notebook.add(self.scope, text="示波器")
         main.add(log_card, weight=2)
 
         footer = ttk.Frame(self.root, style="Card.TFrame", padding=(14, 8))
@@ -407,6 +462,9 @@ class ImageTransmissionApp:
         if message.data_text:
             line += f"  |  数据: {message.data_text}"
         self.log_panes.get(message.level, self.log_panes["info"]).append(line)
+        # Packets reaching this point have passed both IMGT CRC checks.  The
+        # raw printf compatibility mode has no packet envelope to validate.
+        self.scope.add_message(message)
         self.log_count += 1
 
     def _show_image(self, packet: Packet) -> None:
@@ -473,6 +531,7 @@ class ImageTransmissionApp:
                 f"RGB565 · {packet.width} × {packet.height} · {self.frame_rate:.1f} FPS · "
                 f"序号 {packet.sequence} · 第 {self.image_count} 帧{save_state}"
             )
+            self._render_active_processing_tab()
         except (tk.TclError, ValueError) as exc:
             self._append_system_error(f"图像显示失败：{exc}")
 
@@ -519,6 +578,31 @@ class ImageTransmissionApp:
         self._resize_render_pending = False
         self._render_current_image()
 
+    def _on_image_tab_changed(self, _event: tk.Event) -> None:
+        self._render_active_processing_tab()
+
+    def _request_processing_refresh(self) -> None:
+        """Debounce slider/spinbox changes before running a PC-side preview."""
+
+        if self._processing_refresh_pending:
+            return
+        self._processing_refresh_pending = True
+        self.root.after(60, self._render_requested_processing_tab)
+
+    def _render_requested_processing_tab(self) -> None:
+        self._processing_refresh_pending = False
+        self._render_active_processing_tab()
+
+    def _render_active_processing_tab(self) -> None:
+        packet = self.last_image_packet
+        if packet is None or not self._source_rgb:
+            return
+        selected = self.image_notebook.select()
+        if selected == str(self.ipm_pane):
+            self.ipm_pane.update_frame(self._source_rgb, packet.width, packet.height)
+        elif selected == str(self.colour_pane):
+            self.colour_pane.update_frame(self._source_rgb, packet.width, packet.height)
+
     def _append_system_error(self, text: str) -> None:
         from protocol import DebugMessage
         from datetime import datetime
@@ -535,6 +619,7 @@ class ImageTransmissionApp:
             f"数据包 {self.packet_count} · 图像 {self.image_count} · FPS {self.frame_rate:.1f} · "
             f"日志 {self.log_count} · 丢包 {self.lost_packet_count} · 丢弃字节 {self.stream_parser.dropped_bytes} · "
             f"头校验错误 {self.stream_parser.header_crc_errors} · 载荷校验错误 {self.stream_parser.payload_crc_errors} · "
+            f"无 CRC 丢弃 {self.stream_parser.missing_payload_crc_errors} · "
             f"已保存 {saved} · 保存跳过 {dropped} · 保存错误 {save_errors}"
         )
 

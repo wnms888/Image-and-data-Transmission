@@ -55,6 +55,20 @@ class StreamParserTests(unittest.TestCase):
         self.assertEqual(parser.feed(frame), [])
         self.assertEqual(parser.payload_crc_errors, 1)
 
+    def test_missing_payload_crc_is_discarded_by_default(self):
+        frame = encode_packet(PACKET_TEXT, b"[info] legacy\n", include_payload_crc=False)
+        parser = StreamParser()
+        self.assertEqual(parser.feed(frame), [])
+        self.assertEqual(parser.missing_payload_crc_errors, 1)
+
+    def test_crc_presence_flag_allows_a_legitimate_zero_crc_value(self):
+        # CRC-32/IEEE of an empty payload is zero.  The explicit flag, rather
+        # than a nonzero value, distinguishes it from an unverified sender.
+        parser = StreamParser()
+        packets = parser.feed(encode_packet(PACKET_TEXT, b""))
+        self.assertEqual(len(packets), 1)
+        self.assertEqual(packets[0].payload, b"")
+
 
 class PrintfParserTests(unittest.TestCase):
     def test_documented_formats_and_string_debug(self):
