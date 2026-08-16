@@ -8,33 +8,41 @@ the received RGB565 frame or the image-saving path.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 import math
+from pathlib import Path
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 from protocol import fit_size, resize_rgb888_nearest, rgb888_to_ppm
 
 
-# MATLAB calibration copied from CameraIPM.h.  The source calibration image is
-# 160 x 128; positions are proportionally adapted when another stream size is
-# received so the preview remains useful while making that limitation explicit.
-_CALIBRATION_WIDTH = 160
-_CALIBRATION_HEIGHT = 128
-_FX = 86.0473887
-_FY = 88.6329816
-_CX = 82.4574101
-_CY = 66.3210952
-_SKEW = 0.0
-_K1 = 0.018489635
-_K2 = -0.028478149
-_P1 = 0.0
-_P2 = 0.0
-_H = (
-    0.00126378934, 0.176208985, -48.1200764,
-    0.447881955, 0.00593926103, -36.8896207,
-    0.0173753584, -1.03867922, 1.0,
-)
+@dataclass(frozen=True)
+class CameraCalibration:
+    """All values from ``EmbedCode/CameraIPM.h`` in editable form."""
+
+    reference_width: int = 160
+    reference_height: int = 128
+    fx: float = 86.0473887
+    fy: float = 88.6329816
+    cx: float = 82.4574101
+    cy: float = 66.3210952
+    skew: float = 0.0
+    radial_count: int = 2
+    k: tuple[float, float, float, float, float, float] = (
+        0.018489635, -0.028478149, 0.0, 0.0, 0.0, 0.0,
+    )
+    p1: float = 0.0
+    p2: float = 0.0
+    homography: tuple[float, float, float, float, float, float, float, float, float] = (
+        0.00126378934, 0.176208985, -48.1200764,
+        0.447881955, 0.00593926103, -36.8896207,
+        0.0173753584, -1.03867922, 1.0,
+    )
+
+
+DEFAULT_CAMERA_CALIBRATION = CameraCalibration()
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,7 @@ class IpmConfig:
     half_width_y: float = 0.75
     output_width: int = 240
     output_height: int = 240
+    calibration: CameraCalibration = DEFAULT_CAMERA_CALIBRATION
 
 
 def _invert_3x3(matrix: tuple[float, ...]) -> tuple[float, ...]:
@@ -61,25 +70,38 @@ def _invert_3x3(matrix: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(value / determinant for value in cofactor)
 
 
-_H_INV = _invert_3x3(_H)
-
-
-def _ground_to_raw_pixel(ground_x: float, ground_y: float) -> tuple[float, float] | None:
+def _ground_to_raw_pixel(
+    ground_x: float,
+    ground_y: float,
+    calibration: CameraCalibration,
+    inverse_h: tuple[float, ...],
+) -> tuple[float, float] | None:
     """Invert the C pipeline: ground -> undistorted pixel -> raw pixel."""
 
-    w = _H_INV[6] * ground_x + _H_INV[7] * ground_y + _H_INV[8]
+    w = inverse_h[6] * ground_x + inverse_h[7] * ground_y + inverse_h[8]
     if abs(w) < 1.0e-12:
         return None
-    uu = (_H_INV[0] * ground_x + _H_INV[1] * ground_y + _H_INV[2]) / w
-    vu = (_H_INV[3] * ground_x + _H_INV[4] * ground_y + _H_INV[5]) / w
-    y = (vu - _CY) / _FY
-    x = (uu - _CX - _SKEW * y) / _FX
+    uu = (inverse_h[0] * ground_x + inverse_h[1] * ground_y + inverse_h[2]) / w
+    vu = (inverse_h[3] * ground_x + inverse_h[4] * ground_y + inverse_h[5]) / w
+    y = (vu - calibration.cy) / calibration.fy
+    x = (uu - calibration.cx - calibration.skew * y) / calibration.fx
     r2 = x * x + y * y
-    radial = 1.0 + _K1 * r2 + _K2 * r2 * r2
-    xd = x * radial + 2.0 * _P1 * x * y + _P2 * (r2 + 2.0 * x * x)
-    yd = y * radial + _P1 * (r2 + 2.0 * y * y) + 2.0 * _P2 * x * y
-    raw_u = _FX * xd + _SKEW * yd + _CX
-    raw_v = _FY * yd + _CY
+    r4 = r2 * r2
+    r6 = r4 * r2
+    radial_count = calibration.radial_count
+    numerator = 1.0 + calibration.k[0] * r2 + calibration.k[1] * r4
+    denominator = 1.0
+    if radial_count >= 3:
+        numerator += calibration.k[2] * r6
+    if radial_count >= 6:
+        denominator += calibration.k[3] * r2 + calibration.k[4] * r4 + calibration.k[5] * r6
+    if abs(denominator) < 1.0e-12:
+        return None
+    radial = numerator / denominator
+    xd = x * radial + 2.0 * calibration.p1 * x * y + calibration.p2 * (r2 + 2.0 * x * x)
+    yd = y * radial + calibration.p1 * (r2 + 2.0 * y * y) + 2.0 * calibration.p2 * x * y
+    raw_u = calibration.fx * xd + calibration.skew * yd + calibration.cx
+    raw_v = calibration.fy * yd + calibration.cy
     if not (math.isfinite(raw_u) and math.isfinite(raw_v)):
         return None
     return raw_u, raw_v
@@ -108,24 +130,22 @@ class IpmProcessor:
         key = (source_width, source_height, config)
         if key == self._lookup_key:
             return
-        if (
-            config.output_width < 8
-            or config.output_height < 8
-            or config.far_x <= config.near_x
-            or config.half_width_y <= 0.0
-        ):
-            raise ValueError("invalid IPM output range")
+        _validate_ipm_config(config)
 
         lookup: list[int] = []
-        x_scale = source_width / _CALIBRATION_WIDTH
-        y_scale = source_height / _CALIBRATION_HEIGHT
+        calibration = config.calibration
+        if calibration.reference_width <= 0 or calibration.reference_height <= 0:
+            raise ValueError("calibration reference size must be positive")
+        inverse_h = _invert_3x3(calibration.homography)
+        x_scale = source_width / calibration.reference_width
+        y_scale = source_height / calibration.reference_height
         for output_y in range(config.output_height):
             x_fraction = output_y / max(1, config.output_height - 1)
             ground_x = config.far_x - x_fraction * (config.far_x - config.near_x)
             for output_x in range(config.output_width):
                 y_fraction = output_x / max(1, config.output_width - 1)
                 ground_y = config.half_width_y - y_fraction * (2.0 * config.half_width_y)
-                source_point = _ground_to_raw_pixel(ground_x, ground_y)
+                source_point = _ground_to_raw_pixel(ground_x, ground_y, calibration, inverse_h)
                 if source_point is None:
                     lookup.append(-1)
                     continue
@@ -147,6 +167,13 @@ class HslThreshold:
     s_max: int
     l_min: int
     l_max: int
+    area_min: int = 10
+    area_max: int = 12000
+    width_min: int = 2
+    height_min: int = 3
+    fill_min_permille: int = 70
+    aspect_min_permille: int = 300
+    aspect_max_permille: int = 5000
 
     def matches(self, h: int, s: int, l: int) -> bool:
         hue_matches = (
@@ -164,7 +191,9 @@ class ColourDetectionConfig:
     red: HslThreshold = HslThreshold(230, 15, 20, 240, 65, 240)
     yellow: HslThreshold = HslThreshold(18, 42, 80, 240, 70, 240)
     roi_top_percent: int = 25
-    minimum_area: int = 10
+    roi_left_percent: int = 0
+    roi_right_percent: int = 100
+    maximum_components: int = 12
 
 
 @dataclass(frozen=True)
@@ -191,9 +220,9 @@ def rgb_to_hsl240(red: int, green: int, blue: int) -> tuple[int, int, int]:
             if hue < 0:
                 hue += 240
         elif maximum == green:
-            hue = 80 + 40 * (blue - red) // difference
+            hue = 80 + int(40 * (blue - red) / difference)
         else:
-            hue = 160 + 40 * (red - green) // difference
+            hue = 160 + int(40 * (red - green) / difference)
         denominator = maximum + minimum if lightness <= 120 else 510 - (maximum + minimum)
         saturation = difference * 240 // denominator if denominator else 0
     return max(0, min(240, hue)), max(0, min(240, saturation)), max(0, min(240, lightness))
@@ -206,10 +235,13 @@ def detect_colours(
 
     if len(rgb) != width * height * 3:
         raise ValueError("source RGB888 dimensions do not match data length")
+    _validate_colour_config(config)
     labels = bytearray(width * height)
     start_row = min(height, max(0, round(height * config.roi_top_percent / 100)))
+    start_column = min(width, max(0, round(width * config.roi_left_percent / 100)))
+    end_column = min(width, max(start_column, round(width * config.roi_right_percent / 100)))
     for y in range(start_row, height):
-        for x in range(width):
+        for x in range(start_column, end_column):
             index = (y * width + x) * 3
             red, green, blue = rgb[index], rgb[index + 1], rgb[index + 2]
             # Same low-cost rejection as cd_fast_red_yellow_candidate().
@@ -229,7 +261,12 @@ def detect_colours(
         if label == 0:
             continue
         component = _take_component(labels, width, height, start_index, label)
-        if len(component) < config.minimum_area:
+        threshold = config.red if label == 1 else config.yellow
+        if not _component_passes_geometry(component, width, threshold):
+            continue
+        if (label == 1 and red_components >= config.maximum_components) or (
+            label == 2 and yellow_components >= config.maximum_components
+        ):
             continue
         colour = (255, 63, 63) if label == 1 else (255, 214, 10)
         for pixel in component:
@@ -241,6 +278,29 @@ def detect_colours(
         else:
             yellow_components += 1
     return ColourDetectionOutput(bytes(output), red_components, yellow_components)
+
+
+def _component_passes_geometry(
+    component: list[int], width: int, threshold: HslThreshold
+) -> bool:
+    area = len(component)
+    if area < threshold.area_min or area > threshold.area_max:
+        return False
+    xmin = min(index % width for index in component)
+    xmax = max(index % width for index in component)
+    ymin = min(index // width for index in component)
+    ymax = max(index // width for index in component)
+    component_width = xmax - xmin + 1
+    component_height = ymax - ymin + 1
+    if component_width < threshold.width_min or component_height < threshold.height_min:
+        return False
+    bbox_area = component_width * component_height
+    fill_permille = area * 1000 // bbox_area
+    aspect_permille = component_height * 1000 // component_width
+    return (
+        fill_permille >= threshold.fill_min_permille
+        and threshold.aspect_min_permille <= aspect_permille <= threshold.aspect_max_permille
+    )
 
 
 def _take_component(
@@ -284,6 +344,122 @@ def _draw_component_border(
         for x in (xmin, xmax):
             index = (y * width + x) * 3
             output[index : index + 3] = bytes(border)
+
+
+class ProcessingConfigError(ValueError):
+    """Raised when an imported image-processing JSON file is malformed."""
+
+
+def save_processing_config(path: str | Path, ipm: IpmConfig, colour: ColourDetectionConfig) -> None:
+    """Write both host-side processing configurations in a portable JSON file."""
+
+    _validate_ipm_config(ipm)
+    _validate_colour_config(colour)
+    payload = {
+        "format": "IMGT-processing-config",
+        "version": 1,
+        "ipm": asdict(ipm),
+        "colour_detection": asdict(colour),
+    }
+    Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_processing_config(path: str | Path) -> tuple[IpmConfig, ColourDetectionConfig]:
+    """Load and validate a configuration exported by :func:`save_processing_config`."""
+
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if payload.get("format") != "IMGT-processing-config" or payload.get("version") != 1:
+            raise ProcessingConfigError("不是受支持的 IMGT 图像处理配置文件")
+        ipm_data = payload["ipm"]
+        colour_data = payload["colour_detection"]
+        calibration_data = ipm_data["calibration"]
+        calibration = CameraCalibration(
+            reference_width=int(calibration_data["reference_width"]),
+            reference_height=int(calibration_data["reference_height"]),
+            fx=float(calibration_data["fx"]), fy=float(calibration_data["fy"]),
+            cx=float(calibration_data["cx"]), cy=float(calibration_data["cy"]),
+            skew=float(calibration_data["skew"]), radial_count=int(calibration_data["radial_count"]),
+            k=_float_tuple(calibration_data["k"], 6, "k"),
+            p1=float(calibration_data["p1"]), p2=float(calibration_data["p2"]),
+            homography=_float_tuple(calibration_data["homography"], 9, "homography"),
+        )
+        ipm = IpmConfig(
+            near_x=float(ipm_data["near_x"]), far_x=float(ipm_data["far_x"]),
+            half_width_y=float(ipm_data["half_width_y"]),
+            output_width=int(ipm_data["output_width"]), output_height=int(ipm_data["output_height"]),
+            calibration=calibration,
+        )
+        colour = ColourDetectionConfig(
+            red=_threshold_from_dict(colour_data["red"]),
+            yellow=_threshold_from_dict(colour_data["yellow"]),
+            roi_top_percent=int(colour_data["roi_top_percent"]),
+            roi_left_percent=int(colour_data["roi_left_percent"]),
+            roi_right_percent=int(colour_data["roi_right_percent"]),
+            maximum_components=int(colour_data["maximum_components"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ProcessingConfigError(f"配置内容无效：{error}") from error
+    _validate_ipm_config(ipm)
+    _validate_colour_config(colour)
+    return ipm, colour
+
+
+def _float_tuple(value: object, length: int, name: str) -> tuple[float, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise ProcessingConfigError(f"{name} 必须包含 {length} 个数值")
+    return tuple(float(item) for item in value)
+
+
+def _threshold_from_dict(value: object) -> HslThreshold:
+    if not isinstance(value, dict):
+        raise ProcessingConfigError("颜色阈值必须是对象")
+    fields = (
+        "h_min", "h_max", "s_min", "s_max", "l_min", "l_max",
+        "area_min", "area_max", "width_min", "height_min",
+        "fill_min_permille", "aspect_min_permille", "aspect_max_permille",
+    )
+    return HslThreshold(*(int(value[field]) for field in fields))
+
+
+def _validate_ipm_config(config: IpmConfig) -> None:
+    calibration = config.calibration
+    calibration_numbers = (
+        calibration.fx, calibration.fy, calibration.cx, calibration.cy, calibration.skew,
+        *calibration.k, calibration.p1, calibration.p2, *calibration.homography,
+    )
+    if (
+        config.output_width < 8 or config.output_height < 8
+        or config.far_x <= config.near_x or config.half_width_y <= 0.0
+        or calibration.reference_width <= 0 or calibration.reference_height <= 0
+        or abs(calibration.fx) < 1.0e-12 or abs(calibration.fy) < 1.0e-12
+        or calibration.radial_count not in (2, 3, 6)
+        or not all(math.isfinite(value) for value in (config.near_x, config.far_x, config.half_width_y, *calibration_numbers))
+    ):
+        raise ProcessingConfigError("逆透视参数范围无效")
+    _invert_3x3(calibration.homography)
+
+
+def _validate_colour_config(config: ColourDetectionConfig) -> None:
+    if not (
+        0 <= config.roi_top_percent <= 100
+        and 0 <= config.roi_left_percent < config.roi_right_percent <= 100
+        and config.maximum_components > 0
+    ):
+        raise ProcessingConfigError("颜色检测 ROI 或组件数量范围无效")
+    for threshold in (config.red, config.yellow):
+        if (
+            not all(0 <= value <= 240 for value in (
+                threshold.h_min, threshold.h_max, threshold.s_min, threshold.s_max,
+                threshold.l_min, threshold.l_max,
+            ))
+            or threshold.area_min <= 0 or threshold.area_max < threshold.area_min
+            or threshold.width_min <= 0 or threshold.height_min <= 0
+            or threshold.fill_min_permille < 0
+            or threshold.aspect_min_permille < 0
+            or threshold.aspect_max_permille < threshold.aspect_min_permille
+        ):
+            raise ProcessingConfigError("颜色阈值范围无效")
 
 
 class _ImagePreview(ttk.Frame):
@@ -365,6 +541,8 @@ class IpmPane(_DualImagePane):
         self._on_change = on_change
         self._processor = IpmProcessor()
         self._frame: tuple[bytes, int, int] | None = None
+        self.calibration = DEFAULT_CAMERA_CALIBRATION
+        self._scale_value_labels: list[tuple[tk.StringVar, tk.DoubleVar, str]] = []
         self.near_x_var = tk.DoubleVar(value=0.20)
         self.far_x_var = tk.DoubleVar(value=2.00)
         self.half_width_var = tk.DoubleVar(value=0.75)
@@ -378,12 +556,15 @@ class IpmPane(_DualImagePane):
         self._add_scale("半宽 Y", self.half_width_var, 0.20, 2.50, 1, 0, "{:.2f}")
         self._add_spin("输出宽", self.output_width_var, 80, 480, 1, 3)
         self._add_spin("输出高", self.output_height_var, 80, 480, 1, 5)
+        ttk.Button(self.controls, text="标定参数…", command=self._open_calibration_editor).grid(
+            row=2, column=0, sticky="w", pady=(5, 0)
+        )
         ttk.Label(
             self.controls,
-            text="参数沿用 CameraIPM 标定；输入尺寸会按 160×128 标定基准换算。",
+            text="参数默认与 CameraIPM.h 一致；标定窗口可编辑全部相机与单应矩阵参数。",
             style="Section.TLabel",
             foreground="#94a3b8",
-        ).grid(row=2, column=0, columnspan=7, sticky="w", pady=(5, 0))
+        ).grid(row=2, column=1, columnspan=6, sticky="w", pady=(5, 0))
 
     def _add_scale(
         self,
@@ -396,6 +577,7 @@ class IpmPane(_DualImagePane):
         pattern: str,
     ) -> None:
         value = tk.StringVar(value=pattern.format(variable.get()))
+        self._scale_value_labels.append((value, variable, pattern))
         ttk.Label(self.controls, text=label, style="Section.TLabel").grid(
             row=row, column=column, sticky="w", padx=(0, 4)
         )
@@ -432,17 +614,117 @@ class IpmPane(_DualImagePane):
             value_label.set(pattern.format(variable.get()))
         self._on_change()
 
+    def get_config(self) -> IpmConfig:
+        return IpmConfig(
+            near_x=float(self.near_x_var.get()),
+            far_x=float(self.far_x_var.get()),
+            half_width_y=float(self.half_width_var.get()),
+            output_width=int(self.output_width_var.get()),
+            output_height=int(self.output_height_var.get()),
+            calibration=self.calibration,
+        )
+
+    def apply_config(self, config: IpmConfig) -> None:
+        _validate_ipm_config(config)
+        self.near_x_var.set(config.near_x)
+        self.far_x_var.set(config.far_x)
+        self.half_width_var.set(config.half_width_y)
+        self.output_width_var.set(config.output_width)
+        self.output_height_var.set(config.output_height)
+        self.calibration = config.calibration
+        for value_label, variable, pattern in self._scale_value_labels:
+            value_label.set(pattern.format(variable.get()))
+        self._on_change()
+
+    def _open_calibration_editor(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("CameraIPM 标定参数")
+        window.minsize(700, 420)
+        window.geometry("780x470")
+        window.transient(self.winfo_toplevel())
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        content = ttk.Frame(window, style="Card.TFrame", padding=(12, 10))
+        content.grid(row=0, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=1)
+        content.columnconfigure(2, weight=1)
+
+        calibration = self.calibration
+        values: dict[str, tk.StringVar] = {}
+
+        def add_group(
+            column: int, title: str, fields: list[tuple[str, str, float | int]]
+        ) -> None:
+            group = ttk.LabelFrame(content, text=f" {title} ", padding=(8, 6))
+            group.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column < 2 else (0, 0))
+            group.columnconfigure(1, weight=1)
+            for row, (key, label, value) in enumerate(fields):
+                values[key] = tk.StringVar(value=str(value))
+                ttk.Label(group, text=label, style="Section.TLabel").grid(
+                    row=row, column=0, sticky="w", padx=(0, 5), pady=2
+                )
+                ttk.Entry(group, textvariable=values[key], style="Input.TEntry", width=13).grid(
+                    row=row, column=1, sticky="ew", pady=2
+                )
+
+        add_group(0, "内参与图像尺寸", [
+            ("reference_width", "标定宽", calibration.reference_width),
+            ("reference_height", "标定高", calibration.reference_height),
+            ("fx", "FX", calibration.fx), ("fy", "FY", calibration.fy),
+            ("cx", "CX", calibration.cx), ("cy", "CY", calibration.cy),
+            ("skew", "Skew", calibration.skew), ("radial_count", "径向项数", calibration.radial_count),
+        ])
+        add_group(1, "畸变参数", [
+            *((f"k{index}", f"K{index + 1}", calibration.k[index]) for index in range(6)),
+            ("p1", "P1", calibration.p1), ("p2", "P2", calibration.p2),
+        ])
+        add_group(2, "单应矩阵 H", [
+            *((f"h{index}", f"H{index // 3 + 1}{index % 3 + 1}", calibration.homography[index]) for index in range(9)),
+        ])
+
+        actions = ttk.Frame(content, style="Card.TFrame")
+        actions.grid(row=1, column=0, columnspan=3, sticky="e", pady=(10, 0))
+
+        def apply() -> None:
+            try:
+                updated = CameraCalibration(
+                    reference_width=int(values["reference_width"].get()),
+                    reference_height=int(values["reference_height"].get()),
+                    fx=float(values["fx"].get()), fy=float(values["fy"].get()),
+                    cx=float(values["cx"].get()), cy=float(values["cy"].get()),
+                    skew=float(values["skew"].get()), radial_count=int(values["radial_count"].get()),
+                    k=tuple(float(values[f"k{index}"].get()) for index in range(6)),
+                    p1=float(values["p1"].get()), p2=float(values["p2"].get()),
+                    homography=tuple(float(values[f"h{index}"].get()) for index in range(9)),
+                )
+                self.apply_config(IpmConfig(
+                    near_x=float(self.near_x_var.get()), far_x=float(self.far_x_var.get()),
+                    half_width_y=float(self.half_width_var.get()),
+                    output_width=int(self.output_width_var.get()),
+                    output_height=int(self.output_height_var.get()), calibration=updated,
+                ))
+            except (ValueError, ProcessingConfigError) as error:
+                messagebox.showerror("标定参数无效", str(error), parent=window)
+                return
+            window.destroy()
+
+        def apply_defaults() -> None:
+            self.apply_config(IpmConfig())
+            window.destroy()
+
+        ttk.Button(actions, text="应用嵌入式默认值", command=apply_defaults).grid(
+            row=0, column=0, padx=3
+        )
+        ttk.Button(actions, text="取消", command=window.destroy).grid(row=0, column=1, padx=3)
+        ttk.Button(actions, text="应用", style="Accent.TButton", command=apply).grid(row=0, column=2, padx=3)
+
     def update_frame(self, rgb: bytes, width: int, height: int) -> None:
         self._frame = (rgb, width, height)
         self.original_preview.set_image(rgb, width, height)
         try:
-            config = IpmConfig(
-                near_x=float(self.near_x_var.get()),
-                far_x=float(self.far_x_var.get()),
-                half_width_y=float(self.half_width_var.get()),
-                output_width=int(self.output_width_var.get()),
-                output_height=int(self.output_height_var.get()),
-            )
+            config = self.get_config()
+            _validate_ipm_config(config)
             result = self._processor.process(rgb, width, height, config)
             self.result_preview.set_image(result, config.output_width, config.output_height)
         except (tk.TclError, ValueError) as error:
@@ -462,17 +744,26 @@ class ColourDetectionPane(_DualImagePane):
         self.info_var = tk.StringVar(value="等待图像")
         self.red_vars = self._make_threshold_variables((230, 15, 20, 240, 65, 240))
         self.yellow_vars = self._make_threshold_variables((18, 42, 80, 240, 70, 240))
+        self.red_geometry_vars = self._make_geometry_variables(ColourDetectionConfig().red)
+        self.yellow_geometry_vars = self._make_geometry_variables(ColourDetectionConfig().yellow)
         self.roi_top_var = tk.IntVar(value=25)
-        self.minimum_area_var = tk.IntVar(value=10)
+        self.roi_left_var = tk.IntVar(value=0)
+        self.roi_right_var = tk.IntVar(value=100)
+        self.maximum_components_var = tk.IntVar(value=12)
 
         red_group = self._add_threshold_group("红色 HSL（0–240）", self.red_vars, 0)
         yellow_group = self._add_threshold_group("黄色 HSL（0–240）", self.yellow_vars, 1)
         generic_group = ttk.LabelFrame(self.controls, text=" 组件过滤 ", padding=(6, 4))
         generic_group.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
         self._add_spin_field(generic_group, "ROI 顶部 (%)", self.roi_top_var, 0, 95, 0)
-        self._add_spin_field(generic_group, "最小面积", self.minimum_area_var, 1, 2000, 1)
+        self._add_spin_field(generic_group, "ROI 左侧 (%)", self.roi_left_var, 0, 99, 1)
+        self._add_spin_field(generic_group, "ROI 右侧 (%)", self.roi_right_var, 1, 100, 2)
+        self._add_spin_field(generic_group, "每色最大组件", self.maximum_components_var, 1, 99, 3)
         ttk.Label(generic_group, textvariable=self.info_var, foreground="#93c5fd").grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        ttk.Button(generic_group, text="完整阈值…", command=self._open_geometry_editor).grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0)
         )
         self.controls.columnconfigure(0, weight=1)
         self.controls.columnconfigure(1, weight=1)
@@ -482,6 +773,18 @@ class ColourDetectionPane(_DualImagePane):
     @staticmethod
     def _make_threshold_variables(values: tuple[int, int, int, int, int, int]) -> tuple[tk.IntVar, ...]:
         return tuple(tk.IntVar(value=value) for value in values)
+
+    @staticmethod
+    def _make_geometry_variables(threshold: HslThreshold) -> dict[str, tk.IntVar]:
+        return {
+            "area_min": tk.IntVar(value=threshold.area_min),
+            "area_max": tk.IntVar(value=threshold.area_max),
+            "width_min": tk.IntVar(value=threshold.width_min),
+            "height_min": tk.IntVar(value=threshold.height_min),
+            "fill_min_permille": tk.IntVar(value=threshold.fill_min_permille),
+            "aspect_min_permille": tk.IntVar(value=threshold.aspect_min_permille),
+            "aspect_max_permille": tk.IntVar(value=threshold.aspect_max_permille),
+        }
 
     def _add_threshold_group(
         self, title: str, variables: tuple[tk.IntVar, ...], column: int
@@ -505,19 +808,114 @@ class ColourDetectionPane(_DualImagePane):
         spin.bind("<Return>", lambda _event: self._on_change())
 
     @staticmethod
-    def _threshold(values: tuple[tk.IntVar, ...]) -> HslThreshold:
-        return HslThreshold(*(max(0, min(240, int(value.get()))) for value in values))
+    def _threshold(values: tuple[tk.IntVar, ...], geometry: dict[str, tk.IntVar]) -> HslThreshold:
+        hsl = [max(0, min(240, int(value.get()))) for value in values]
+        return HslThreshold(
+            *hsl,
+            area_min=max(1, int(geometry["area_min"].get())),
+            area_max=max(1, int(geometry["area_max"].get())),
+            width_min=max(1, int(geometry["width_min"].get())),
+            height_min=max(1, int(geometry["height_min"].get())),
+            fill_min_permille=max(0, int(geometry["fill_min_permille"].get())),
+            aspect_min_permille=max(0, int(geometry["aspect_min_permille"].get())),
+            aspect_max_permille=max(0, int(geometry["aspect_max_permille"].get())),
+        )
+
+    def get_config(self) -> ColourDetectionConfig:
+        return ColourDetectionConfig(
+            red=self._threshold(self.red_vars, self.red_geometry_vars),
+            yellow=self._threshold(self.yellow_vars, self.yellow_geometry_vars),
+            roi_top_percent=max(0, min(100, int(self.roi_top_var.get()))),
+            roi_left_percent=max(0, min(100, int(self.roi_left_var.get()))),
+            roi_right_percent=max(0, min(100, int(self.roi_right_var.get()))),
+            maximum_components=max(1, int(self.maximum_components_var.get())),
+        )
+
+    def apply_config(self, config: ColourDetectionConfig) -> None:
+        _validate_colour_config(config)
+        self._set_threshold_variables(self.red_vars, self.red_geometry_vars, config.red)
+        self._set_threshold_variables(self.yellow_vars, self.yellow_geometry_vars, config.yellow)
+        self.roi_top_var.set(config.roi_top_percent)
+        self.roi_left_var.set(config.roi_left_percent)
+        self.roi_right_var.set(config.roi_right_percent)
+        self.maximum_components_var.set(config.maximum_components)
+        self._on_change()
+
+    @staticmethod
+    def _set_threshold_variables(
+        hsl_variables: tuple[tk.IntVar, ...], geometry_variables: dict[str, tk.IntVar], threshold: HslThreshold
+    ) -> None:
+        for variable, value in zip(
+            hsl_variables,
+            (threshold.h_min, threshold.h_max, threshold.s_min, threshold.s_max, threshold.l_min, threshold.l_max),
+        ):
+            variable.set(value)
+        for key in geometry_variables:
+            geometry_variables[key].set(getattr(threshold, key))
+
+    def _open_geometry_editor(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("ColorDetection 完整组件阈值")
+        window.minsize(540, 320)
+        window.geometry("610x360")
+        window.transient(self.winfo_toplevel())
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        content = ttk.Frame(window, style="Card.TFrame", padding=(12, 10))
+        content.grid(row=0, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=1)
+        labels = (
+            ("area_min", "最小面积"), ("area_max", "最大面积"),
+            ("width_min", "最小宽度"), ("height_min", "最小高度"),
+            ("fill_min_permille", "最小填充‰"),
+            ("aspect_min_permille", "最小纵横比‰"),
+            ("aspect_max_permille", "最大纵横比‰"),
+        )
+        edit_vars: dict[str, tuple[tk.StringVar, tk.StringVar]] = {}
+        for column, (title, geometry) in enumerate((("红色", self.red_geometry_vars), ("黄色", self.yellow_geometry_vars))):
+            group = ttk.LabelFrame(content, text=f" {title}组件过滤 ", padding=(8, 6))
+            group.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column == 0 else (0, 0))
+            group.columnconfigure(1, weight=1)
+            for row, (key, label) in enumerate(labels):
+                red_var = tk.StringVar(value=str(geometry[key].get()))
+                edit_vars.setdefault(key, (red_var, tk.StringVar()))
+                if column == 1:
+                    edit_vars[key] = (edit_vars[key][0], red_var)
+                ttk.Label(group, text=label, style="Section.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 5), pady=2)
+                ttk.Entry(group, textvariable=red_var, style="Input.TEntry", width=10).grid(row=row, column=1, sticky="ew", pady=2)
+
+        actions = ttk.Frame(content, style="Card.TFrame")
+        actions.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        def apply() -> None:
+            try:
+                for key, values in edit_vars.items():
+                    self.red_geometry_vars[key].set(int(values[0].get()))
+                    self.yellow_geometry_vars[key].set(int(values[1].get()))
+                _validate_colour_config(self.get_config())
+            except (tk.TclError, ValueError, ProcessingConfigError) as error:
+                messagebox.showerror("颜色阈值无效", str(error), parent=window)
+                return
+            self._on_change()
+            window.destroy()
+
+        def apply_defaults() -> None:
+            self.apply_config(ColourDetectionConfig())
+            window.destroy()
+
+        ttk.Button(actions, text="应用嵌入式默认值", command=apply_defaults).grid(
+            row=0, column=0, padx=3
+        )
+        ttk.Button(actions, text="取消", command=window.destroy).grid(row=0, column=1, padx=3)
+        ttk.Button(actions, text="应用", style="Accent.TButton", command=apply).grid(row=0, column=2, padx=3)
 
     def update_frame(self, rgb: bytes, width: int, height: int) -> None:
         self._frame = (rgb, width, height)
         self.original_preview.set_image(rgb, width, height)
         try:
-            config = ColourDetectionConfig(
-                red=self._threshold(self.red_vars),
-                yellow=self._threshold(self.yellow_vars),
-                roi_top_percent=max(0, min(95, int(self.roi_top_var.get()))),
-                minimum_area=max(1, int(self.minimum_area_var.get())),
-            )
+            config = self.get_config()
+            _validate_colour_config(config)
             result = detect_colours(rgb, width, height, config)
             self.result_preview.set_image(result.image, width, height)
             self.info_var.set(f"红色 {result.red_components} 个 · 黄色 {result.yellow_components} 个")

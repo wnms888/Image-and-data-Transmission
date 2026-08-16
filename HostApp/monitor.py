@@ -8,10 +8,16 @@ from pathlib import Path
 import queue
 import tkinter as tk
 from time import perf_counter
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from frame_saver import FrameSaveWorker
-from image_processing import ColourDetectionPane, IpmPane
+from image_processing import (
+    ColourDetectionPane,
+    IpmPane,
+    ProcessingConfigError,
+    load_processing_config,
+    save_processing_config,
+)
 from oscilloscope import OscilloscopePane
 from protocol import (
     PACKET_IMAGE_RGB565,
@@ -291,7 +297,16 @@ class ImageTransmissionApp:
         image_card = ttk.LabelFrame(main, text=" 实时图像 ", padding=(10, 10))
         image_card.columnconfigure(0, weight=1)
         image_card.rowconfigure(1, weight=1)
-        ttk.Label(image_card, textvariable=self.image_info_var, foreground="#93c5fd").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        image_header = ttk.Frame(image_card, style="Card.TFrame")
+        image_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        image_header.columnconfigure(0, weight=1)
+        ttk.Label(image_header, textvariable=self.image_info_var, foreground="#93c5fd").grid(row=0, column=0, sticky="w")
+        ttk.Button(image_header, text="导入处理配置", command=self.import_processing_config).grid(
+            row=0, column=1, padx=(6, 3)
+        )
+        ttk.Button(image_header, text="导出处理配置", command=self.export_processing_config).grid(
+            row=0, column=2, padx=(3, 0)
+        )
         self.image_notebook = ttk.Notebook(image_card)
         self.image_notebook.grid(row=1, column=0, sticky="nsew")
         live_tab = ttk.Frame(self.image_notebook, style="Card.TFrame")
@@ -602,6 +617,43 @@ class ImageTransmissionApp:
             self.ipm_pane.update_frame(self._source_rgb, packet.width, packet.height)
         elif selected == str(self.colour_pane):
             self.colour_pane.update_frame(self._source_rgb, packet.width, packet.height)
+
+    def export_processing_config(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="导出图像处理配置",
+            initialdir=str(Path(__file__).resolve().parent),
+            initialfile="imgt_processing_config.json",
+            defaultextension=".json",
+            filetypes=(("JSON 配置文件", "*.json"), ("所有文件", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            save_processing_config(path, self.ipm_pane.get_config(), self.colour_pane.get_config())
+        except (OSError, ValueError, ProcessingConfigError) as error:
+            messagebox.showerror("导出失败", str(error), parent=self.root)
+            return
+        self.storage_info_var.set(f"已导出图像处理配置：{Path(path).name}")
+
+    def import_processing_config(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="导入图像处理配置",
+            initialdir=str(Path(__file__).resolve().parent),
+            filetypes=(("JSON 配置文件", "*.json"), ("所有文件", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            ipm_config, colour_config = load_processing_config(path)
+            self.ipm_pane.apply_config(ipm_config)
+            self.colour_pane.apply_config(colour_config)
+        except (OSError, ValueError, ProcessingConfigError) as error:
+            messagebox.showerror("导入失败", str(error), parent=self.root)
+            return
+        self.storage_info_var.set(f"已导入图像处理配置：{Path(path).name}")
+        self._request_processing_refresh()
 
     def _append_system_error(self, text: str) -> None:
         from protocol import DebugMessage
