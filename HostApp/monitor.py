@@ -83,11 +83,20 @@ class LogPane(ttk.Frame):
         self.text.configure(yscrollcommand=scrollbar.set)
 
     def append(self, text: str) -> None:
+        self.append_batch([text])
+
+    def append_batch(self, lines: list[str]) -> None:
+        """Append a group with one Tk update instead of one update per line."""
+
+        if not lines:
+            return
         self.text.configure(state="normal")
-        self.text.insert("end", text + "\n")
-        # Keep the GUI responsive during long-running telemetry sessions.
-        if int(self.text.index("end-1c").split(".")[0]) > 1200:
-            self.text.delete("1.0", "201.0")
+        self.text.insert("end", "\n".join(lines) + "\n")
+        # Keep both memory use and text-widget reflow bounded in long-running
+        # telemetry sessions.  Retain the newest 1,000 rendered lines.
+        line_count = int(self.text.index("end-1c").split(".")[0])
+        if line_count > 1200:
+            self.text.delete("1.0", f"{line_count - 999}.0")
         self.text.see("end")
         self.text.configure(state="disabled")
 
@@ -119,6 +128,14 @@ class ImageTransmissionApp:
         self._resize_render_pending = False
         self._preview_dirty = False
         self._processing_refresh_pending = False
+        # IPM and connected-component colour detection are intentionally
+        # CPU-side previews.  Keep their refresh rate bounded so the live
+        # camera and packet receiver stay responsive at high frame rates.
+        self._last_processing_render_at = 0.0
+        self._processing_frame_interval = 1.0 / 12.0
+        self._pending_log_lines: dict[str, list[str]] = {
+            "info": [], "warning": [], "error": []
+        }
         self._frame_times: deque[float] = deque()
         self.frame_rate = 0.0
         self.lost_packet_count = 0
@@ -344,6 +361,7 @@ class ImageTransmissionApp:
         self.debug_notebook.add(log_tab, text="分级日志")
         self.scope = OscilloscopePane(self.debug_notebook)
         self.debug_notebook.add(self.scope, text="示波器")
+        self.debug_notebook.bind("<<NotebookTabChanged>>", self._on_debug_tab_changed)
         main.add(log_card, weight=2)
 
         footer = ttk.Frame(self.root, style="Card.TFrame", padding=(14, 8))
@@ -425,27 +443,34 @@ class ImageTransmissionApp:
         self._set_status("已停止", connected=False)
 
     def _drain_events(self) -> None:
-        try:
-            while True:
+        # Do not let a continuous TCP sender monopolise Tk's event loop.  A
+        # short budget preserves input throughput while leaving time to paint,
+        # resize, hover the scope, and handle button clicks.
+        deadline = perf_counter() + 0.010
+        processed = 0
+        while processed < 256 and perf_counter() < deadline:
+            try:
                 kind, data = self.events.get_nowait()
-                if kind == "data":
-                    self._consume_bytes(data if isinstance(data, bytes) else b"")
-                elif kind == "status":
-                    self._set_status(str(data), connected=True)
-                elif kind == "error":
-                    self._set_status(f"连接错误：{data}", connected=False)
-                    self._append_system_error(str(data))
-                elif kind == "stopped" and self.worker is not None and not self.worker.is_alive():
-                    self.worker = None
-                    self.connect_button.configure(text="开始接收")
-                    self._set_status(str(data), connected=False)
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                break
+            processed += 1
+            if kind == "data":
+                self._consume_bytes(data if isinstance(data, bytes) else b"")
+            elif kind == "status":
+                self._set_status(str(data), connected=True)
+            elif kind == "error":
+                self._set_status(f"连接错误：{data}", connected=False)
+                self._append_system_error(str(data))
+            elif kind == "stopped" and self.worker is not None and not self.worker.is_alive():
+                self.worker = None
+                self.connect_button.configure(text="开始接收")
+                self._set_status(str(data), connected=False)
         if self._preview_dirty:
             self._preview_dirty = False
             self._render_current_image()
+        self._flush_log_batches()
         self._update_stats()
-        self.root.after(30, self._drain_events)
+        self.root.after(1 if not self.events.empty() else 30, self._drain_events)
 
     def _consume_bytes(self, data: bytes) -> None:
         if self.protocol_var.get() == RAW_PROTOCOL:
@@ -476,11 +501,20 @@ class ImageTransmissionApp:
         line = f"[{stamp}] {message.description}"
         if message.data_text:
             line += f"  |  数据: {message.data_text}"
-        self.log_panes.get(message.level, self.log_panes["info"]).append(line)
+        level = message.level if message.level in self._pending_log_lines else "info"
+        self._pending_log_lines[level].append(line)
         # Packets reaching this point have passed both IMGT CRC checks.  The
         # raw printf compatibility mode has no packet envelope to validate.
         self.scope.add_message(message)
         self.log_count += 1
+
+    def _flush_log_batches(self) -> None:
+        """Render queued per-level logs once at the end of a GUI tick."""
+
+        for level, lines in self._pending_log_lines.items():
+            if lines:
+                self.log_panes[level].append_batch(lines)
+                lines.clear()
 
     def _show_image(self, packet: Packet) -> None:
         now = perf_counter()
@@ -594,7 +628,13 @@ class ImageTransmissionApp:
         self._render_current_image()
 
     def _on_image_tab_changed(self, _event: tk.Event) -> None:
-        self._render_active_processing_tab()
+        self._render_active_processing_tab(force=True)
+
+    def _on_debug_tab_changed(self, _event: tk.Event) -> None:
+        """Redraw the scope only after its notebook page becomes visible."""
+
+        if self.debug_notebook.select() == str(self.scope):
+            self.scope.request_redraw()
 
     def _request_processing_refresh(self) -> None:
         """Debounce slider/spinbox changes before running a PC-side preview."""
@@ -606,16 +646,22 @@ class ImageTransmissionApp:
 
     def _render_requested_processing_tab(self) -> None:
         self._processing_refresh_pending = False
-        self._render_active_processing_tab()
+        self._render_active_processing_tab(force=True)
 
-    def _render_active_processing_tab(self) -> None:
+    def _render_active_processing_tab(self, force: bool = False) -> None:
         packet = self.last_image_packet
         if packet is None or not self._source_rgb:
             return
         selected = self.image_notebook.select()
+        if selected not in (str(self.ipm_pane), str(self.colour_pane)):
+            return
+        now = perf_counter()
+        if not force and now - self._last_processing_render_at < self._processing_frame_interval:
+            return
+        self._last_processing_render_at = now
         if selected == str(self.ipm_pane):
             self.ipm_pane.update_frame(self._source_rgb, packet.width, packet.height)
-        elif selected == str(self.colour_pane):
+        else:
             self.colour_pane.update_frame(self._source_rgb, packet.width, packet.height)
 
     def export_processing_config(self) -> None:
@@ -678,6 +724,8 @@ class ImageTransmissionApp:
     def clear_logs(self) -> None:
         for pane in self.log_panes.values():
             pane.clear()
+        for lines in self._pending_log_lines.values():
+            lines.clear()
 
     def close(self) -> None:
         self.disconnect()

@@ -65,8 +65,13 @@ class ScopeModelTests(unittest.TestCase):
         model.pan(-5)
         self.assertAlmostEqual(model.view_end_timestamp(), timestamp.timestamp() + 25)
         self.assertLess(model.time_position(), 1.0)
+        end_time, visible, visible_timestamps = model.visible_snapshot()
+        self.assertAlmostEqual(end_time, timestamp.timestamp() + 25)
+        self.assertEqual([sample.values[0] for sample in visible], [20.0])
+        self.assertEqual(visible_timestamps, [sample.timestamp for sample in visible])
         model.set_time_position(0.0)
         self.assertAlmostEqual(model.view_end_timestamp(), timestamp.timestamp() + 10)
+        self.assertEqual([sample.values[0] for sample in model.visible_samples()[1]], [0.0, 10.0])
         model.follow_latest()
         self.assertAlmostEqual(model.view_end_timestamp(), timestamp.timestamp() + 30)
         model.paused = True

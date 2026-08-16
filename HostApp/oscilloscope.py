@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 import math
 import tkinter as tk
 from tkinter import ttk
@@ -32,6 +32,18 @@ class ScopeModel:
         # None means the view follows the latest sample.  A timestamp freezes
         # the visible time interval while new samples keep arriving.
         self._view_end_timestamp: float | None = None
+        # Drawing and pointer tracking request the same view repeatedly.  Keep
+        # a snapshot until data or the time view changes, rather than copying
+        # every sample on every 33 ms redraw.
+        self._visible_cache_key: tuple[float, float, float, float, int] | None = None
+        self._visible_cache: list[ScopeSample] = []
+        self._visible_timestamps: list[float] = []
+        self._auto_y_cache_for: list[ScopeSample] | None = None
+        self._auto_y_cache: tuple[float, float] = (-1.0, 1.0)
+
+    def _invalidate_cached_view(self) -> None:
+        self._visible_cache_key = None
+        self._auto_y_cache_for = None
 
     def add_message(self, message: DebugMessage) -> bool:
         if not self.enabled or self.paused or not message.values:
@@ -43,19 +55,49 @@ class ScopeModel:
         cutoff = sample.timestamp - self.history_seconds
         while self.samples and self.samples[0].timestamp < cutoff:
             self.samples.popleft()
+        self._invalidate_cached_view()
         return True
 
     def clear(self) -> None:
         self.samples.clear()
         self._manual_y_limits = None
         self._view_end_timestamp = None
+        self._invalidate_cached_view()
 
     def visible_samples(self) -> tuple[float, list[ScopeSample]]:
+        end_time, visible, _timestamps = self.visible_snapshot()
+        return end_time, visible
+
+    def visible_snapshot(self) -> tuple[float, list[ScopeSample], list[float]]:
+        """Return a cached visible sample range and its timestamps.
+
+        The timestamp list is shared with the view and lets the hover handler
+        use binary search without rebuilding it for every mouse movement.
+        """
+
         if not self.samples:
-            return 0.0, []
+            return 0.0, [], []
         end_time = self.view_end_timestamp()
         start_time = end_time - self.time_window_seconds
-        return end_time, [sample for sample in self.samples if sample.timestamp >= start_time]
+        key = (
+            self.samples[0].timestamp,
+            self.samples[-1].timestamp,
+            end_time,
+            self.time_window_seconds,
+            len(self.samples),
+        )
+        if key != self._visible_cache_key:
+            # deque does not support binary-search indexing efficiently; make
+            # one bounded snapshot only when the data/view has actually moved.
+            all_samples = list(self.samples)
+            timestamps = [sample.timestamp for sample in all_samples]
+            first = bisect_left(timestamps, start_time)
+            last = bisect_right(timestamps, end_time)
+            self._visible_cache = all_samples[first:last]
+            self._visible_timestamps = timestamps[first:last]
+            self._visible_cache_key = key
+            self._auto_y_cache_for = None
+        return end_time, self._visible_cache, self._visible_timestamps
 
     def view_end_timestamp(self) -> float:
         """Return the right edge of the visible time interval, clamped safely."""
@@ -111,21 +153,32 @@ class ScopeModel:
     def y_limits(self, visible: list[ScopeSample]) -> tuple[float, float]:
         if self._manual_y_limits is not None:
             return self._manual_y_limits
-        values = [value for sample in visible for value in sample.values]
-        if not values:
-            return -1.0, 1.0
-        lower, upper = min(values), max(values)
+        if self._auto_y_cache_for is visible:
+            return self._auto_y_cache
+        lower = math.inf
+        upper = -math.inf
+        for sample in visible:
+            for value in sample.values:
+                lower = min(lower, value)
+                upper = max(upper, value)
+        if lower == math.inf:
+            self._auto_y_cache_for = visible
+            self._auto_y_cache = (-1.0, 1.0)
+            return self._auto_y_cache
         if lower == upper:
             padding = max(abs(lower) * 0.1, 1.0)
         else:
             padding = (upper - lower) * 0.1
-        return lower - padding, upper + padding
+        self._auto_y_cache_for = visible
+        self._auto_y_cache = (lower - padding, upper + padding)
+        return self._auto_y_cache
 
     def zoom_x(self, factor: float) -> None:
         """factor < 1 zooms the time axis in; factor > 1 zooms it out."""
         self.time_window_seconds = min(
             self.history_seconds, max(0.1, self.time_window_seconds * factor)
         )
+        self._invalidate_cached_view()
 
     def zoom_y(self, factor: float, visible: list[ScopeSample]) -> None:
         """factor < 1 zooms the amplitude axis in; factor > 1 zooms it out."""
@@ -161,44 +214,51 @@ class OscilloscopePane(ttk.Frame):
         self._updating_time_position = False
         self._drag_last_x: int | None = None
         self._plot_state: tuple[
-            int, int, int, int, float, float, float, list[ScopeSample]
+            int, int, int, int, float, float, float, list[ScopeSample], list[float]
         ] | None = None
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
         controls = ttk.Frame(self, style="Card.TFrame")
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 7))
-        controls.columnconfigure(3, weight=1)
+        # Keep the frequent controls in two short rows.  The former layout
+        # scattered X/Y labels and actions across the full pane, which made
+        # the toolbar wrap awkwardly once the main window was narrowed.
+        controls.columnconfigure(4, weight=1)
         ttk.Checkbutton(
             controls,
             text="启用示波器",
             variable=self.enabled_var,
             command=self._on_enabled_changed,
-        ).grid(row=0, column=0, sticky="w", padx=(4, 8), pady=3)
+        ).grid(row=0, column=0, sticky="w", padx=(5, 8), pady=3)
         self.pause_button = ttk.Button(controls, textvariable=self.pause_var, command=self._toggle_pause)
         self.pause_button.grid(row=0, column=1, padx=3, pady=3)
-        ttk.Label(controls, text="X 轴", style="Section.TLabel").grid(row=0, column=2, sticky="e", padx=(8, 2))
-        ttk.Button(controls, text="放大", command=lambda: self._zoom_x(1 / 1.6)).grid(
-            row=0, column=3, padx=3, pady=3, sticky="w"
+        ttk.Label(controls, text="水平", style="Section.TLabel").grid(
+            row=0, column=2, sticky="e", padx=(10, 1)
         )
-        ttk.Button(controls, text="缩小", command=lambda: self._zoom_x(1.6)).grid(
-            row=0, column=4, padx=3, pady=3
+        ttk.Button(controls, text="X+", width=4, command=lambda: self._zoom_x(1 / 1.6)).grid(
+            row=0, column=3, padx=2, pady=3
         )
-        ttk.Label(controls, text="Y 轴", style="Section.TLabel").grid(row=1, column=0, sticky="e", padx=(8, 2))
-        ttk.Button(controls, text="放大", command=lambda: self._zoom_y(1 / 1.6)).grid(
-            row=1, column=1, padx=3, pady=3
+        ttk.Button(controls, text="X−", width=4, command=lambda: self._zoom_x(1.6)).grid(
+            row=0, column=4, padx=2, pady=3, sticky="w"
         )
-        ttk.Button(controls, text="缩小", command=lambda: self._zoom_y(1.6)).grid(
-            row=1, column=2, padx=3, pady=3
+        ttk.Label(controls, text="垂直", style="Section.TLabel").grid(
+            row=1, column=0, sticky="e", padx=(5, 1)
         )
-        ttk.Button(controls, text="Y 自动", command=self._auto_scale).grid(
-            row=1, column=3, padx=3, pady=3, sticky="w"
+        ttk.Button(controls, text="Y+", width=4, command=lambda: self._zoom_y(1 / 1.6)).grid(
+            row=1, column=1, padx=2, pady=3
+        )
+        ttk.Button(controls, text="Y−", width=4, command=lambda: self._zoom_y(1.6)).grid(
+            row=1, column=2, padx=2, pady=3
+        )
+        ttk.Button(controls, text="Y自动", command=self._auto_scale).grid(
+            row=1, column=3, padx=(7, 2), pady=3
         )
         ttk.Button(controls, text="清除", command=self._clear).grid(
-            row=1, column=4, padx=3, pady=3
+            row=1, column=4, padx=(2, 5), pady=3, sticky="w"
         )
-        ttk.Label(controls, text="时间轴", style="Section.TLabel").grid(
-            row=2, column=0, sticky="e", padx=(4, 4)
+        ttk.Label(controls, text="时间", style="Section.TLabel").grid(
+            row=2, column=0, sticky="e", padx=(5, 3)
         )
         ttk.Button(controls, text="◀", command=lambda: self._pan(-1)).grid(
             row=2, column=1, padx=3, pady=3
@@ -210,15 +270,15 @@ class OscilloscopePane(ttk.Frame):
             variable=self.time_position_var,
             command=self._on_time_position_changed,
         )
-        self.time_scale.grid(row=2, column=2, columnspan=2, sticky="ew", padx=3, pady=3)
+        self.time_scale.grid(row=2, column=2, columnspan=3, sticky="ew", padx=3, pady=3)
         ttk.Button(controls, text="▶", command=lambda: self._pan(1)).grid(
-            row=2, column=4, padx=3, pady=3
+            row=2, column=5, padx=3, pady=3
         )
         ttk.Button(controls, text="实时", command=self._follow_latest).grid(
-            row=2, column=5, padx=(3, 6), pady=3
+            row=2, column=6, padx=(3, 6), pady=3
         )
         ttk.Label(controls, textvariable=self.view_var, style="Section.TLabel", foreground="#94a3b8").grid(
-            row=3, column=0, columnspan=6, sticky="w", padx=(4, 4), pady=(1, 2)
+            row=3, column=0, columnspan=7, sticky="w", padx=(5, 5), pady=(1, 2)
         )
 
         self.canvas = tk.Canvas(
@@ -234,12 +294,16 @@ class OscilloscopePane(ttk.Frame):
         self.canvas.bind("<ButtonPress-1>", self._on_pan_start)
         self.canvas.bind("<B1-Motion>", self._on_pan_drag)
         self.canvas.bind("<ButtonRelease-1>", lambda _event: self._on_pan_end())
+        self.bind("<Visibility>", lambda _event: self.request_redraw())
         self._update_pause_button()
         self.request_redraw()
 
     def add_message(self, message: DebugMessage) -> None:
         if self.model.add_message(message):
-            self.request_redraw()
+            # There is no reason to spend canvas time while the log tab is
+            # visible.  The visibility handler redraws immediately on return.
+            if self.winfo_ismapped():
+                self.request_redraw()
 
     def request_redraw(self) -> None:
         if self._redraw_pending:
@@ -305,7 +369,7 @@ class OscilloscopePane(ttk.Frame):
     def _on_pan_drag(self, event: tk.Event) -> None:
         if self._drag_last_x is None or self._plot_state is None:
             return
-        _left, _top, plot_width, _plot_height, _end, _lower, _upper, _visible = self._plot_state
+        _left, _top, plot_width, _plot_height, _end, _lower, _upper, _visible, _timestamps = self._plot_state
         if plot_width <= 0:
             return
         seconds = -(event.x - self._drag_last_x) / plot_width * self.model.time_window_seconds
@@ -324,9 +388,11 @@ class OscilloscopePane(ttk.Frame):
         left, right, top, bottom = 58, 14, 16, 30
         plot_width = max(1, width - left - right)
         plot_height = max(1, height - top - bottom)
-        end_time, visible = self.model.visible_samples()
+        end_time, visible, timestamps = self.model.visible_snapshot()
         lower, upper = self.model.y_limits(visible)
-        self._plot_state = (left, top, plot_width, plot_height, end_time, lower, upper, visible)
+        self._plot_state = (
+            left, top, plot_width, plot_height, end_time, lower, upper, visible, timestamps
+        )
         self._updating_time_position = True
         self.time_position_var.set(self.model.time_position())
         self._updating_time_position = False
@@ -376,7 +442,7 @@ class OscilloscopePane(ttk.Frame):
         if state is None:
             self._hide_tooltip()
             return
-        left, top, plot_width, plot_height, end_time, lower, upper, visible = state
+        left, top, plot_width, plot_height, end_time, lower, upper, visible, timestamps = state
         if (
             not visible
             or event.x < left
@@ -389,14 +455,27 @@ class OscilloscopePane(ttk.Frame):
 
         start_time = end_time - self.model.time_window_seconds
         target_time = start_time + (event.x - left) / plot_width * self.model.time_window_seconds
-        timestamps = [sample.timestamp for sample in visible]
         right = bisect_left(timestamps, target_time)
-        candidates = visible[max(0, right - 1) : min(len(visible), right + 1)]
+        # With envelope rendering several samples can share a single screen
+        # column.  Check that small time slice so hovering an extremum still
+        # reveals the actual sample that produced the visible line.
+        time_per_pixel = self.model.time_window_seconds / max(plot_width, 1)
+        first = bisect_left(timestamps, target_time - time_per_pixel)
+        last = bisect_right(timestamps, target_time + time_per_pixel)
+        candidates = visible[first:last]
+        if not candidates:
+            candidates = visible[max(0, right - 1) : min(len(visible), right + 1)]
         if not candidates:
             self._hide_tooltip()
             return
-        sample = min(candidates, key=lambda item: abs(item.timestamp - target_time))
         y_range = max(upper - lower, 1e-9)
+        sample = min(
+            candidates,
+            key=lambda item: min(
+                abs(event.y - (top + (upper - value) / y_range * plot_height))
+                for value in item.values
+            ),
+        )
         distances = [
             abs(event.y - (top + (upper - value) / y_range * plot_height))
             for value in sample.values
@@ -487,11 +566,35 @@ class OscilloscopePane(ttk.Frame):
         lines: list[list[float]] = [[] for _ in range(channel_count)]
         range_size = max(upper - lower, 1e-9)
         start_time = end_time - self.model.time_window_seconds
-        for sample in visible:
-            x = left + (sample.timestamp - start_time) / self.model.time_window_seconds * plot_width
-            for index, value in enumerate(sample.values):
-                y = top + (upper - value) / range_size * plot_height
-                lines[index].extend((x, y))
+        # A canvas cannot show more detail than it has horizontal pixels.  At
+        # high telemetry rates render an envelope (min/max for each pixel
+        # column) instead of handing Tk tens of thousands of vertices.
+        if len(visible) > plot_width * 2:
+            columns: list[dict[int, list[float]]] = [dict() for _ in range(channel_count)]
+            last_column = max(1, plot_width - 1)
+            for sample in visible:
+                fraction = (sample.timestamp - start_time) / self.model.time_window_seconds
+                column = max(0, min(last_column, int(fraction * last_column)))
+                for index, value in enumerate(sample.values):
+                    y = top + (upper - value) / range_size * plot_height
+                    envelope = columns[index].get(column)
+                    if envelope is None:
+                        columns[index][column] = [y, y]
+                    else:
+                        envelope[0] = min(envelope[0], y)
+                        envelope[1] = max(envelope[1], y)
+            for index, channel_columns in enumerate(columns):
+                for column, (minimum, maximum) in channel_columns.items():
+                    x = left + column
+                    lines[index].extend((x, minimum))
+                    if maximum - minimum > 0.25:
+                        lines[index].extend((x, maximum))
+        else:
+            for sample in visible:
+                x = left + (sample.timestamp - start_time) / self.model.time_window_seconds * plot_width
+                for index, value in enumerate(sample.values):
+                    y = top + (upper - value) / range_size * plot_height
+                    lines[index].extend((x, y))
         for index, points in enumerate(lines):
             color = self._COLORS[index % len(self._COLORS)]
             if len(points) >= 4:
