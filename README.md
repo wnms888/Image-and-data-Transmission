@@ -7,6 +7,9 @@
 ```text
 EmbedCode/
   WifiImageTransfer.c/.h   嵌入式 WiFi 图像、日志帧与 Printf 接口
+  CameraIPM.c/.h           共享标定的像素/地面坐标逆透视映射
+  ColorDetection.c/.h      共享阈值的红黄 HSL 颜色检测
+  TC4ImageProcessingConfig.h 上位机导出的唯一嵌入式图像处理配置文件
 HostApp/
   monitor.py               可缩放图形化上位机
   protocol.py              IMGT v1 分帧、校验、RGB565 解码和 PNG 编码
@@ -81,7 +84,7 @@ netsh advfirewall show currentprofile
 - **逆透视**：默认完整匹配 `CameraIPM.h` 的图像尺寸、内参、径向/切向畸变和单应矩阵；可调俯视范围/输出尺寸，也可在“标定参数”窗口修改全部标定值。
 - **颜色检测**：默认完整匹配 `ColorDetection.c` 的红黄 HSL 阈值、ROI、面积、宽高、填充率、纵横比和每色最大组件数；主界面和“完整阈值”窗口均可调整。
 
-“导出处理配置”和“导入处理配置”会读写一个 UTF-8 JSON 文件，其中同时保存逆透视与颜色检测的全部参数，便于与嵌入式参数版本对应管理。
+“导出配置（JSON + C）”会保存可再次导入上位机的 UTF-8 JSON，并生成可直接覆盖到嵌入式工程的完整 C 头文件；“导入处理配置”读取 JSON 恢复两页参数。
 
 ## 颜色异常排查
 
@@ -121,6 +124,14 @@ printf("[warning] channel_data: %d, %d, %d, %d\n", 12, 13, 14, 15);
 
 日志 FIFO 数组默认 1024 字节（环形队列保留一个空位，实际可排队 1023 字节），单个文本包的安全上限默认 256 字节；服务函数在 `\n` 或达到该上限时封包。`[error]`、`[warning]`、`[info]` 分别显示在三个独立文本框；省略等级时默认 `info`。FIFO 满时会丢弃最新日志字节而不会影响图像传输。
 
+## 图像处理配置同步到嵌入式端
+
+“实时图像”标题栏的“导出配置（JSON + C）”会同时生成三份内容：用于再次导入上位机的 JSON、与 JSON 同目录的 `*_embedded_config.h`，以及项目内已同步更新的 [EmbedCode/TC4ImageProcessingConfig.h](EmbedCode/TC4ImageProcessingConfig.h)。C 文件是完整头文件，不是零散参数片段。
+
+首次接入时，将本仓库更新后的 `CameraIPM.c/.h`、`ColorDetection.c/.h` 和 `TC4ImageProcessingConfig.h` 放入嵌入式工程并重新编译。此后每次在上位机调整逆透视或红黄颜色检测参数，只需点击导出、把导出的 `TC4ImageProcessingConfig.h` 整个覆盖到嵌入式工程同名文件，然后重新编译；不需要再修改任何 C 源文件。
+
+该文件同步相机标定参考尺寸、内参、畸变、单应矩阵、鸟瞰图范围和尺寸，以及红黄 HSL、几何过滤、ROI 百分比和每色最大组件数。嵌入式端会按 SCC8660 实际尺寸换算标定坐标，颜色 ROI 也按百分比换算，因此与上位机预览采用同一组定义。`Camera_GetIpmViewConfig()` 可直接取得导出的鸟瞰图范围；`Camera_GroundToRawPixel()` 和 `Camera_RawPixelToGround()` 使用同一份标定。
+
 ## 数据帧
 
 IMGT v1 使用固定 22 字节小端头：`AA 55`、版本、类型、载荷长度、宽高、像素格式、标志、序号、头 CRC-16、载荷 CRC-32。类型 `1` 为 RGB565 图像，类型 `2` 为 UTF-8/ASCII Printf 文本。标志 bit 1 说明载荷 CRC 是否存在；嵌入式端与上位机默认都要求该标志和 CRC-32。头 CRC、载荷 CRC 失败或 CRC 标志缺失的完整包会直接丢弃，绝不会显示为图像、文本日志或示波器曲线。完整字段说明见 [HostApp/README.zh-CN.md](HostApp/README.zh-CN.md)。
@@ -132,4 +143,4 @@ Set-Location HostApp
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖 TCP 分片重组、CRC/重同步与缺失 CRC 丢弃、Printf 格式、示波器暂停/历史回看模型、RGB565 高低字节解码、逆透视/颜色检测与配置导入导出模型、等比缩放、PNG 保存和串口描述展示。
+测试覆盖 TCP 分片重组、CRC/重同步与缺失 CRC 丢弃、Printf 格式、示波器暂停/历史回看模型、RGB565 高低字节解码、逆透视/颜色检测、JSON 与嵌入式 C 配置导出、等比缩放、PNG 保存和串口描述展示。

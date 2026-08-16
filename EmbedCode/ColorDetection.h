@@ -16,44 +16,57 @@
 #define CODE_COLORDETECTION_H_
 
 #include "Header.h"
+#include "TC4ImageProcessingConfig.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define COLOR_DETECTION_MAX_CONES            (12u)
+#define COLOR_DETECTION_MAX_CONES            (TC4_CFG_COLOR_MAX_CONES)
+
+/* Host and target both express ROI as percentages of the current frame.  The
+ * +50 form is round-to-nearest for the SCC8660 dimensions and matches the
+ * host preview's pixel conversion. */
+#define COLOR_DETECTION_PERCENT_TO_X(percent) \
+    ((uint16)(((uint32)SCC8660_W * (uint32)(percent) + 50u) / 100u))
+#define COLOR_DETECTION_PERCENT_TO_Y(percent) \
+    ((uint16)(((uint32)SCC8660_H * (uint32)(percent) + 50u) / 100u))
 
 /* Detect cones only in the lower half of the camera image. This excludes the
  * upper-background region while retaining the complete image width.
  */
-#define COLOR_DETECTION_ROI_X_MIN            (0u)
-#define COLOR_DETECTION_ROI_X_MAX            (SCC8660_W - 1u)
-#define COLOR_DETECTION_ROI_Y_MIN            (SCC8660_H / 4u)
+#define COLOR_DETECTION_ROI_X_MIN            \
+    (COLOR_DETECTION_PERCENT_TO_X(TC4_CFG_COLOR_ROI_LEFT_PERCENT))
+#define COLOR_DETECTION_ROI_X_MAX            \
+    (COLOR_DETECTION_PERCENT_TO_X(TC4_CFG_COLOR_ROI_RIGHT_PERCENT) - 1u)
+#define COLOR_DETECTION_ROI_Y_MIN            \
+    (COLOR_DETECTION_PERCENT_TO_Y(TC4_CFG_COLOR_ROI_TOP_PERCENT))
 #define COLOR_DETECTION_ROI_Y_MAX            (SCC8660_H - 1u)
 
 /* The old code used SWAPBYTE() before RGB565 decoding.
  * Keep this enabled unless the camera DATA_FORMAT / DMA byte order is changed.
  */
-#define COLOR_DETECTION_SWAP_RGB565_BYTES    (1u)
+#define COLOR_DETECTION_SWAP_RGB565_BYTES    (TC4_CFG_COLOR_SWAP_RGB565_BYTES)
 
 /* Number of image rows used to estimate cone-ground contact x position. */
-#define COLOR_DETECTION_BOTTOM_BAND_ROWS     (3u)
-#define COLOR_DETECTION_BOTTOM_MIN_PIXELS    (2u)
+#define COLOR_DETECTION_BOTTOM_BAND_ROWS     (TC4_CFG_COLOR_BOTTOM_BAND_ROWS)
+#define COLOR_DETECTION_BOTTOM_MIN_PIXELS    (TC4_CFG_COLOR_BOTTOM_MIN_PIXELS)
 
 /* White sign-board detection. A pixel is white only when every channel is
  * bright and its chroma is low.  The component-area limit is evaluated in the
  * same lower-half ROI used for cone detection. */
-#define COLOR_DETECTION_WHITE_MIN_CHANNEL    (TC4_CFG_DETECTION_WHITE_MIN)
-#define COLOR_DETECTION_WHITE_MAX_CHROMA     (TC4_CFG_DETECTION_WHITE_CHROMA_MAX)
-#define COLOR_DETECTION_WHITE_MIN_AREA       (TC4_CFG_DETECTION_MIN_AREA)
-#define COLOR_DETECTION_WHITE_ROI_Y_MIN      (TC4_PREPROCESS_ROI_TOP)
+#define COLOR_DETECTION_WHITE_MIN_CHANNEL    (TC4_CFG_WHITE_MIN_CHANNEL)
+#define COLOR_DETECTION_WHITE_MAX_CHROMA     (TC4_CFG_WHITE_MAX_CHROMA)
+#define COLOR_DETECTION_WHITE_MIN_AREA       (TC4_CFG_WHITE_MIN_AREA)
+#define COLOR_DETECTION_WHITE_ROI_Y_MIN      \
+    (COLOR_DETECTION_PERCENT_TO_Y(TC4_CFG_WHITE_ROI_TOP_PERCENT))
 #define COLOR_DETECTION_WHITE_ROI_Y_MAX      (SCC8660_H - 1u)
 
 /* Copy SCC8660 DMA image before processing.
  * This avoids processing a buffer that can be overwritten by the next frame.
  * Cost: SCC8660_W*SCC8660_H*2 bytes extra RAM and one frame memcpy.
  */
-#define COLOR_DETECTION_COPY_CAMERA_FRAME    (0u)
+#define COLOR_DETECTION_COPY_CAMERA_FRAME    (TC4_CFG_COLOR_COPY_CAMERA_FRAME)
 
 typedef enum
 {

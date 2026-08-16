@@ -16,6 +16,7 @@ from image_processing import (
     IpmPane,
     ProcessingConfigError,
     load_processing_config,
+    save_embedded_processing_config,
     save_processing_config,
 )
 from oscilloscope import OscilloscopePane
@@ -321,7 +322,7 @@ class ImageTransmissionApp:
         ttk.Button(image_header, text="导入处理配置", command=self.import_processing_config).grid(
             row=0, column=1, padx=(6, 3)
         )
-        ttk.Button(image_header, text="导出处理配置", command=self.export_processing_config).grid(
+        ttk.Button(image_header, text="导出配置（JSON + C）", command=self.export_processing_config).grid(
             row=0, column=2, padx=(3, 0)
         )
         self.image_notebook = ttk.Notebook(image_card)
@@ -676,11 +677,24 @@ class ImageTransmissionApp:
         if not path:
             return
         try:
-            save_processing_config(path, self.ipm_pane.get_config(), self.colour_pane.get_config())
+            ipm_config = self.ipm_pane.get_config()
+            colour_config = self.colour_pane.get_config()
+            save_processing_config(path, ipm_config, colour_config)
+            json_path = Path(path)
+            copy_header_path = json_path.with_name(f"{json_path.stem}_embedded_config.h")
+            embedded_header_path = (
+                Path(__file__).resolve().parents[1]
+                / "EmbedCode"
+                / "TC4ImageProcessingConfig.h"
+            )
+            save_embedded_processing_config(copy_header_path, ipm_config, colour_config)
+            save_embedded_processing_config(embedded_header_path, ipm_config, colour_config)
         except (OSError, ValueError, ProcessingConfigError) as error:
             messagebox.showerror("导出失败", str(error), parent=self.root)
             return
-        self.storage_info_var.set(f"已导出图像处理配置：{Path(path).name}")
+        self.storage_info_var.set(
+            f"已导出 JSON 与 C 配置：{Path(path).name}；已同步 EmbedCode/TC4ImageProcessingConfig.h"
+        )
 
     def import_processing_config(self) -> None:
         path = filedialog.askopenfilename(

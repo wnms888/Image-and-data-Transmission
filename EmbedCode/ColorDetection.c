@@ -5,6 +5,8 @@
  */
 
 #include "Header.h"
+#include "ColorDetection.h"
+#include "CameraIPM.h"
 
 #define CD_LABEL_NONE       ((uint8)COLOR_DETECTION_NONE)
 #define CD_LABEL_RED        ((uint8)COLOR_DETECTION_RED)
@@ -34,26 +36,24 @@ static uint16 s_frame_copy[SCC8660_H][SCC8660_W];
  * box, or wider than tall; all of those properties are rejected below. */
 ColorDetectionThreshold g_color_detection_red_threshold =
 {
-		230u, 15u,        // H：跨越0点，230~240 或 0~15
-		20u,  240u,       // S
-		65u,  240u,       // L：原80降低到65
-
-		10u,  12000u,
-		2u,   3u,
-		70u,
-		300u, 5000u
+    TC4_CFG_RED_H_MIN, TC4_CFG_RED_H_MAX,
+    TC4_CFG_RED_S_MIN, TC4_CFG_RED_S_MAX,
+    TC4_CFG_RED_L_MIN, TC4_CFG_RED_L_MAX,
+    TC4_CFG_RED_AREA_MIN, TC4_CFG_RED_AREA_MAX,
+    TC4_CFG_RED_WIDTH_MIN, TC4_CFG_RED_HEIGHT_MIN,
+    TC4_CFG_RED_FILL_MIN_PERMILLE,
+    TC4_CFG_RED_ASPECT_MIN_PERMILLE, TC4_CFG_RED_ASPECT_MAX_PERMILLE
 };
 
 ColorDetectionThreshold g_color_detection_yellow_threshold =
 {
-		18u,  42u,        // H：原24~40放宽
-		80u,  240u,       // S：原120降低到80
-		70u,  240u,       // L：原120降低到70
-
-		10u,  12000u,
-		2u,   3u,
-		70u,
-		300u, 5000u
+    TC4_CFG_YELLOW_H_MIN, TC4_CFG_YELLOW_H_MAX,
+    TC4_CFG_YELLOW_S_MIN, TC4_CFG_YELLOW_S_MAX,
+    TC4_CFG_YELLOW_L_MIN, TC4_CFG_YELLOW_L_MAX,
+    TC4_CFG_YELLOW_AREA_MIN, TC4_CFG_YELLOW_AREA_MAX,
+    TC4_CFG_YELLOW_WIDTH_MIN, TC4_CFG_YELLOW_HEIGHT_MIN,
+    TC4_CFG_YELLOW_FILL_MIN_PERMILLE,
+    TC4_CFG_YELLOW_ASPECT_MIN_PERMILLE, TC4_CFG_YELLOW_ASPECT_MAX_PERMILLE
 };
 
 typedef struct
