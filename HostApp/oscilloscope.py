@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from protocol import DebugMessage
+import theme as ui
 
 
 @dataclass(frozen=True)
@@ -199,8 +200,8 @@ class OscilloscopePane(ttk.Frame):
     """Canvas chart with capture enable, zoom, autoscale, and clear controls."""
 
     _COLORS = (
-        "#38bdf8", "#fbbf24", "#fb7185", "#a78bfa",
-        "#34d399", "#fb923c", "#e879f9", "#94a3b8",
+        "#6E9BFF", "#F2C078", "#F08787", "#AD9CF4",
+        "#81C9A5", "#E9A977", "#DB95CA", "#B6BBC4",
     )
 
     def __init__(self, parent: tk.Misc) -> None:
@@ -221,68 +222,72 @@ class OscilloscopePane(ttk.Frame):
         self.rowconfigure(1, weight=1)
         controls = ttk.Frame(self, style="Card.TFrame")
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 7))
-        # Keep the frequent controls in two short rows.  The former layout
-        # scattered X/Y labels and actions across the full pane, which made
-        # the toolbar wrap awkwardly once the main window was narrowed.
-        controls.columnconfigure(4, weight=1)
+        controls.columnconfigure(0, weight=1)
+        capture_row = ttk.Frame(controls, style="Card.TFrame")
+        capture_row.grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(
-            controls,
+            capture_row,
             text="启用示波器",
             variable=self.enabled_var,
             command=self._on_enabled_changed,
-        ).grid(row=0, column=0, sticky="w", padx=(5, 8), pady=3)
-        self.pause_button = ttk.Button(controls, textvariable=self.pause_var, command=self._toggle_pause)
-        self.pause_button.grid(row=0, column=1, padx=3, pady=3)
-        ttk.Label(controls, text="水平", style="Section.TLabel").grid(
-            row=0, column=2, sticky="e", padx=(10, 1)
+        ).grid(row=0, column=0, sticky="w", padx=(3, 8), pady=3)
+        self.pause_button = ttk.Button(
+            capture_row, textvariable=self.pause_var, style="Compact.TButton", command=self._toggle_pause
         )
-        ttk.Button(controls, text="X+", width=4, command=lambda: self._zoom_x(1 / 1.6)).grid(
-            row=0, column=3, padx=2, pady=3
+        self.pause_button.grid(row=0, column=1, padx=2, pady=3)
+
+        zoom_row = ttk.Frame(controls, style="Card.TFrame")
+        zoom_row.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(zoom_row, text="水平", style="Section.TLabel", foreground=ui.MUTED).grid(
+            row=0, column=0, padx=(3, 4)
         )
-        ttk.Button(controls, text="X−", width=4, command=lambda: self._zoom_x(1.6)).grid(
-            row=0, column=4, padx=2, pady=3, sticky="w"
+        ttk.Label(zoom_row, text="垂直", style="Section.TLabel", foreground=ui.MUTED).grid(
+            row=0, column=3, padx=(5, 4)
         )
-        ttk.Label(controls, text="垂直", style="Section.TLabel").grid(
-            row=1, column=0, sticky="e", padx=(5, 1)
+        for column, (label, action) in enumerate((
+            ("X+", lambda: self._zoom_x(1 / 1.6)),
+            ("X−", lambda: self._zoom_x(1.6)),
+            ("Y+", lambda: self._zoom_y(1 / 1.6)),
+            ("Y−", lambda: self._zoom_y(1.6)),
+            ("Y自动", self._auto_scale),
+            ("清除", self._clear),
+        )):
+            ttk.Button(
+                zoom_row, text=label, width=4 if column < 4 else 6,
+                style="Compact.TButton", command=action
+            ).grid(row=0, column=column + (1 if column < 2 else 2), padx=(0, 4), pady=2)
+
+        timeline_row = ttk.Frame(controls, style="Card.TFrame")
+        timeline_row.grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        timeline_row.columnconfigure(2, weight=1)
+        ttk.Label(timeline_row, text="时间", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(3, 5)
         )
-        ttk.Button(controls, text="Y+", width=4, command=lambda: self._zoom_y(1 / 1.6)).grid(
-            row=1, column=1, padx=2, pady=3
-        )
-        ttk.Button(controls, text="Y−", width=4, command=lambda: self._zoom_y(1.6)).grid(
-            row=1, column=2, padx=2, pady=3
-        )
-        ttk.Button(controls, text="Y自动", command=self._auto_scale).grid(
-            row=1, column=3, padx=(7, 2), pady=3
-        )
-        ttk.Button(controls, text="清除", command=self._clear).grid(
-            row=1, column=4, padx=(2, 5), pady=3, sticky="w"
-        )
-        ttk.Label(controls, text="时间", style="Section.TLabel").grid(
-            row=2, column=0, sticky="e", padx=(5, 3)
-        )
-        ttk.Button(controls, text="◀", command=lambda: self._pan(-1)).grid(
-            row=2, column=1, padx=3, pady=3
+        ttk.Button(timeline_row, text="◀", width=3, style="Compact.TButton", command=lambda: self._pan(-1)).grid(
+            row=0, column=1, padx=2, pady=2
         )
         self.time_scale = ttk.Scale(
-            controls,
+            timeline_row,
             from_=0.0,
             to=1.0,
             variable=self.time_position_var,
             command=self._on_time_position_changed,
         )
-        self.time_scale.grid(row=2, column=2, columnspan=3, sticky="ew", padx=3, pady=3)
-        ttk.Button(controls, text="▶", command=lambda: self._pan(1)).grid(
-            row=2, column=5, padx=3, pady=3
+        self.time_scale.grid(row=0, column=2, sticky="ew", padx=5, pady=2)
+        ttk.Button(timeline_row, text="▶", width=3, style="Compact.TButton", command=lambda: self._pan(1)).grid(
+            row=0, column=3, padx=2, pady=2
         )
-        ttk.Button(controls, text="实时", command=self._follow_latest).grid(
-            row=2, column=6, padx=(3, 6), pady=3
+        ttk.Button(timeline_row, text="实时", width=4, style="Compact.TButton", command=self._follow_latest).grid(
+            row=0, column=4, padx=(2, 3), pady=2
         )
-        ttk.Label(controls, textvariable=self.view_var, style="Section.TLabel", foreground="#94a3b8").grid(
-            row=3, column=0, columnspan=7, sticky="w", padx=(5, 5), pady=(1, 2)
+        self.view_label = ttk.Label(controls, textvariable=self.view_var, style="Section.TLabel", foreground=ui.MUTED)
+        self.view_label.grid(
+            row=3, column=0, sticky="w", padx=(3, 3), pady=(2, 1)
         )
+        controls.bind("<Configure>", lambda event: self.view_label.configure(wraplength=max(210, event.width - 8)))
 
         self.canvas = tk.Canvas(
-            self, background="#06101f", highlightthickness=0, cursor="crosshair"
+            self, background=ui.PLOT, highlightthickness=0, cursor="crosshair"
         )
         self.canvas.grid(row=1, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", lambda _event: self.request_redraw())
@@ -403,7 +408,7 @@ class OscilloscopePane(ttk.Frame):
                 width // 2,
                 height // 2,
                 text="示波器已关闭",
-                fill="#94a3b8",
+                fill=ui.MUTED,
                 font=("Microsoft YaHei UI", 11),
             )
         elif not visible:
@@ -411,7 +416,7 @@ class OscilloscopePane(ttk.Frame):
                 width // 2,
                 height // 2,
                 text="等待通过校验的数值数据",
-                fill="#94a3b8",
+                fill=ui.MUTED,
                 font=("Microsoft YaHei UI", 11),
             )
         else:
@@ -498,7 +503,7 @@ class OscilloscopePane(ttk.Frame):
             y - 10,
             text=text,
             anchor="sw",
-            fill="#e2e8f0",
+            fill=ui.TEXT,
             font=("Microsoft YaHei UI", 9),
             tags="scope-tooltip",
         )
@@ -517,7 +522,7 @@ class OscilloscopePane(ttk.Frame):
             left, top, right, bottom = bounds
         background = canvas.create_rectangle(
             left - 6, top - 4, right + 6, bottom + 4,
-            fill="#172554", outline="#60a5fa", tags="scope-tooltip"
+            fill=ui.SURFACE_RAISED, outline=ui.BLUE, tags="scope-tooltip"
         )
         canvas.tag_lower(background, label)
 
@@ -535,7 +540,7 @@ class OscilloscopePane(ttk.Frame):
         upper: float,
     ) -> None:
         canvas = self.canvas
-        grid_color, label_color, axis_color = "#26364f", "#94a3b8", "#64748b"
+        grid_color, label_color, axis_color = ui.SURFACE_RAISED, ui.MUTED, ui.HAIRLINE
         for index in range(6):
             fraction = index / 5.0
             x = left + fraction * plot_width
@@ -611,5 +616,5 @@ class OscilloscopePane(ttk.Frame):
                 legend_x, legend_y, legend_x + 10, legend_y + 5, fill=color, outline=color
             )
             self.canvas.create_text(
-                legend_x + 14, legend_y + 3, text=f"CH{index + 1}", anchor="w", fill="#dbeafe", font=("Microsoft YaHei UI", 8)
+                legend_x + 14, legend_y + 3, text=f"CH{index + 1}", anchor="w", fill=ui.TEXT, font=("Microsoft YaHei UI", 8)
             )

@@ -1,10 +1,10 @@
 /*
  * ColorDetection.h
  *
- * Red / yellow cone detection for SCC8660 RGB565 images.
+ * Configurable, ordered colour detection for SCC8660 RGB565 images.
  *
  * Pipeline:
- *   RGB565 -> fast reject -> HSL threshold (single pass for red+yellow)
+ *   RGB565 -> HSL -> first matching configured threshold
  *   -> label map -> 4-connected components
  *   -> geometry filter -> bottom contact pixel
  *   -> Camera_RawPixelToGround()
@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 #define COLOR_DETECTION_MAX_CONES            (TC4_CFG_COLOR_MAX_CONES)
+#define COLOR_DETECTION_COLOR_COUNT          (TC4_CFG_COLOR_COUNT)
 
 /* Host and target both express ROI as percentages of the current frame.  The
  * +50 form is round-to-nearest for the SCC8660 dimensions and matches the
@@ -68,13 +69,6 @@ extern "C" {
  */
 #define COLOR_DETECTION_COPY_CAMERA_FRAME    (TC4_CFG_COLOR_COPY_CAMERA_FRAME)
 
-typedef enum
-{
-    COLOR_DETECTION_NONE   = 0,
-    COLOR_DETECTION_RED    = 1,
-    COLOR_DETECTION_YELLOW = 2
-} ColorDetectionColor;
-
 typedef struct
 {
     /* H/S/L range, all 0..240. h_min > h_max means circular Hue interval. */
@@ -101,7 +95,8 @@ typedef struct
 
 typedef struct
 {
-    ColorDetectionColor color;
+    /* 0-based index into g_color_detection_thresholds and result->colours. */
+    uint16 color_index;
 
     /* Raw distorted pixel of cone-ground contact point. */
     uint16 pixel_u;
@@ -127,8 +122,13 @@ typedef struct
 
 typedef struct
 {
-    uint8 red_count;
-    uint8 yellow_count;
+    uint16 count;
+    ColorDetectionCone cones[COLOR_DETECTION_MAX_CONES];
+} ColorDetectionGroup;
+
+typedef struct
+{
+    ColorDetectionGroup colours[COLOR_DETECTION_COLOR_COUNT];
 
     /* Set when one connected, neutral-white region reaches WHITE_MIN_AREA. */
     uint8 large_white_detected;
@@ -144,9 +144,6 @@ typedef struct
     float white_sign_angle_error_rad;
     uint8 white_sign_ipm_valid;
 
-    ColorDetectionCone red[COLOR_DETECTION_MAX_CONES];
-    ColorDetectionCone yellow[COLOR_DETECTION_MAX_CONES];
-
     /* Debug/performance counters. */
     uint32 roi_pixels;
     uint32 fast_rejected_pixels;
@@ -158,14 +155,13 @@ typedef struct
 } ColorDetectionResult;
 
 /* Runtime-adjustable thresholds. */
-extern ColorDetectionThreshold g_color_detection_red_threshold;
-extern ColorDetectionThreshold g_color_detection_yellow_threshold;
+extern ColorDetectionThreshold g_color_detection_thresholds[COLOR_DETECTION_COLOR_COUNT];
 
 /* Clear result/state. No camera reconfiguration is performed here. */
 void ColorDetection_Init(void);
 
 /* Process an already stable RGB565 frame. */
-uint8 ColorDetection_ProcessImage(
+uint32 ColorDetection_ProcessImage(
     const uint16 image[SCC8660_H][SCC8660_W],
     ColorDetectionResult *result);
 

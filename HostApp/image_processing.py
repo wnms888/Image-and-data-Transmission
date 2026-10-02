@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+import colorsys
 import json
 import math
 from pathlib import Path
@@ -16,6 +17,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from protocol import fit_size, resize_rgb888_nearest, rgb888_to_ppm
+import theme as ui
 
 
 @dataclass(frozen=True)
@@ -185,11 +187,23 @@ class HslThreshold:
 
 
 @dataclass(frozen=True)
-class ColourDetectionConfig:
-    """Defaults copied from g_color_detection_*_threshold in ColorDetection.c."""
+class DetectionColour:
+    name: str
+    threshold: HslThreshold
+    preview_rgb: tuple[int, int, int]
 
-    red: HslThreshold = HslThreshold(230, 15, 20, 240, 65, 240)
-    yellow: HslThreshold = HslThreshold(18, 42, 80, 240, 70, 240)
+
+DEFAULT_COLOURS = (
+    DetectionColour("红色", HslThreshold(230, 15, 20, 240, 65, 240), (255, 63, 63)),
+    DetectionColour("黄色", HslThreshold(18, 42, 80, 240, 70, 240), (255, 214, 10)),
+)
+
+
+@dataclass(frozen=True)
+class ColourDetectionConfig:
+    """Ordered detection rules; the first matching HSL rule owns a pixel."""
+
+    colours: tuple[DetectionColour, ...] = DEFAULT_COLOURS
     roi_top_percent: int = 25
     roi_left_percent: int = 0
     roi_right_percent: int = 100
@@ -199,8 +213,15 @@ class ColourDetectionConfig:
 @dataclass(frozen=True)
 class ColourDetectionOutput:
     image: bytes
-    red_components: int
-    yellow_components: int
+    component_counts: tuple[int, ...]
+
+    @property
+    def red_components(self) -> int:
+        return self.component_counts[0] if self.component_counts else 0
+
+    @property
+    def yellow_components(self) -> int:
+        return self.component_counts[1] if len(self.component_counts) > 1 else 0
 
 
 def rgb_to_hsl240(red: int, green: int, blue: int) -> tuple[int, int, int]:
@@ -231,12 +252,12 @@ def rgb_to_hsl240(red: int, green: int, blue: int) -> tuple[int, int, int]:
 def detect_colours(
     rgb: bytes, width: int, height: int, config: ColourDetectionConfig
 ) -> ColourDetectionOutput:
-    """Apply the embedded red/yellow HSL rules and four-connected area filter."""
+    """Apply ordered HSL rules and four-connected area filters."""
 
     if len(rgb) != width * height * 3:
         raise ValueError("source RGB888 dimensions do not match data length")
     _validate_colour_config(config)
-    labels = bytearray(width * height)
+    labels = [0] * (width * height)
     start_row = min(height, max(0, round(height * config.roi_top_percent / 100)))
     start_column = min(width, max(0, round(width * config.roi_left_percent / 100)))
     end_column = min(width, max(start_column, round(width * config.roi_right_percent / 100)))
@@ -244,40 +265,32 @@ def detect_colours(
         for x in range(start_column, end_column):
             index = (y * width + x) * 3
             red, green, blue = rgb[index], rgb[index + 1], rgb[index + 2]
-            # Same low-cost rejection as cd_fast_red_yellow_candidate().
-            if blue >= red and blue >= green:
-                continue
             hue, saturation, lightness = rgb_to_hsl240(red, green, blue)
             label_index = y * width + x
-            if config.red.matches(hue, saturation, lightness):
-                labels[label_index] = 1
-            elif config.yellow.matches(hue, saturation, lightness):
-                labels[label_index] = 2
+            for colour_index, colour in enumerate(config.colours, 1):
+                if colour.threshold.matches(hue, saturation, lightness):
+                    labels[label_index] = colour_index
+                    break
 
     output = bytearray(width * height * 3)
-    red_components = 0
-    yellow_components = 0
+    counts = [0] * len(config.colours)
     for start_index, label in enumerate(labels):
         if label == 0:
             continue
         component = _take_component(labels, width, height, start_index, label)
-        threshold = config.red if label == 1 else config.yellow
+        colour_rule = config.colours[label - 1]
+        threshold = colour_rule.threshold
         if not _component_passes_geometry(component, width, threshold):
             continue
-        if (label == 1 and red_components >= config.maximum_components) or (
-            label == 2 and yellow_components >= config.maximum_components
-        ):
+        if counts[label - 1] >= config.maximum_components:
             continue
-        colour = (255, 63, 63) if label == 1 else (255, 214, 10)
+        colour = colour_rule.preview_rgb
         for pixel in component:
             destination = pixel * 3
             output[destination : destination + 3] = bytes(colour)
         _draw_component_border(output, width, height, component, colour)
-        if label == 1:
-            red_components += 1
-        else:
-            yellow_components += 1
-    return ColourDetectionOutput(bytes(output), red_components, yellow_components)
+        counts[label - 1] += 1
+    return ColourDetectionOutput(bytes(output), tuple(counts))
 
 
 def _component_passes_geometry(
@@ -304,7 +317,7 @@ def _component_passes_geometry(
 
 
 def _take_component(
-    labels: bytearray, width: int, height: int, start_index: int, label: int
+    labels: list[int], width: int, height: int, start_index: int, label: int
 ) -> list[int]:
     labels[start_index] = 0
     stack = [start_index]
@@ -357,7 +370,7 @@ def save_processing_config(path: str | Path, ipm: IpmConfig, colour: ColourDetec
     _validate_colour_config(colour)
     payload = {
         "format": "IMGT-processing-config",
-        "version": 1,
+        "version": 2,
         "ipm": asdict(ipm),
         "colour_detection": asdict(colour),
     }
@@ -388,7 +401,6 @@ def render_embedded_processing_config(ipm: IpmConfig, colour: ColourDetectionCon
     _validate_ipm_config(ipm)
     _validate_colour_config(colour)
     calibration = ipm.calibration
-    red, yellow = colour.red, colour.yellow
 
     lines = [
         "/*",
@@ -437,30 +449,26 @@ def render_embedded_processing_config(ipm: IpmConfig, colour: ColourDetectionCon
         f"#define TC4_IPM_VIEW_OUTPUT_WIDTH                 {_c_uint(ipm.output_width)}",
         f"#define TC4_IPM_VIEW_OUTPUT_HEIGHT                {_c_uint(ipm.output_height)}",
         "",
-        "/* Host-configurable red/yellow detector settings. */",
+        "/* Host-configurable ordered detector settings. */",
+        f"#define TC4_CFG_COLOR_COUNT                       {_c_uint(len(colour.colours))}",
         f"#define TC4_CFG_COLOR_MAX_CONES                   {_c_uint(colour.maximum_components)}",
         f"#define TC4_CFG_COLOR_ROI_TOP_PERCENT             {_c_uint(colour.roi_top_percent)}",
         f"#define TC4_CFG_COLOR_ROI_LEFT_PERCENT            {_c_uint(colour.roi_left_percent)}",
         f"#define TC4_CFG_COLOR_ROI_RIGHT_PERCENT           {_c_uint(colour.roi_right_percent)}",
         "",
     ))
-    for name, threshold in (("RED", red), ("YELLOW", yellow)):
-        lines.extend((
-            f"#define TC4_CFG_{name}_H_MIN                         {_c_uint(threshold.h_min)}",
-            f"#define TC4_CFG_{name}_H_MAX                         {_c_uint(threshold.h_max)}",
-            f"#define TC4_CFG_{name}_S_MIN                         {_c_uint(threshold.s_min)}",
-            f"#define TC4_CFG_{name}_S_MAX                         {_c_uint(threshold.s_max)}",
-            f"#define TC4_CFG_{name}_L_MIN                         {_c_uint(threshold.l_min)}",
-            f"#define TC4_CFG_{name}_L_MAX                         {_c_uint(threshold.l_max)}",
-            f"#define TC4_CFG_{name}_AREA_MIN                      {_c_uint(threshold.area_min)}",
-            f"#define TC4_CFG_{name}_AREA_MAX                      {_c_uint(threshold.area_max)}",
-            f"#define TC4_CFG_{name}_WIDTH_MIN                     {_c_uint(threshold.width_min)}",
-            f"#define TC4_CFG_{name}_HEIGHT_MIN                    {_c_uint(threshold.height_min)}",
-            f"#define TC4_CFG_{name}_FILL_MIN_PERMILLE             {_c_uint(threshold.fill_min_permille)}",
-            f"#define TC4_CFG_{name}_ASPECT_MIN_PERMILLE           {_c_uint(threshold.aspect_min_permille)}",
-            f"#define TC4_CFG_{name}_ASPECT_MAX_PERMILLE           {_c_uint(threshold.aspect_max_permille)}",
-            "",
-        ))
+    lines.append("/* H, S, L, area, width, height, fill and aspect for each rule. */")
+    lines.append("#define TC4_CFG_COLOR_THRESHOLDS \\")
+    for index, item in enumerate(colour.colours):
+        t = item.threshold
+        values = (
+            t.h_min, t.h_max, t.s_min, t.s_max, t.l_min, t.l_max,
+            t.area_min, t.area_max, t.width_min, t.height_min,
+            t.fill_min_permille, t.aspect_min_permille, t.aspect_max_permille,
+        )
+        suffix = " \\" if index + 1 < len(colour.colours) else ""
+        lines.append("    {" + ", ".join(_c_uint(value) for value in values) + "}," + suffix)
+    lines.append("")
     lines.extend((
         "/* Embedded-only safeguards, fixed in every host export. */",
         "#define TC4_CFG_COLOR_SWAP_RGB565_BYTES           (1u)",
@@ -491,7 +499,7 @@ def load_processing_config(path: str | Path) -> tuple[IpmConfig, ColourDetection
 
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        if payload.get("format") != "IMGT-processing-config" or payload.get("version") != 1:
+        if payload.get("format") != "IMGT-processing-config" or payload.get("version") not in (1, 2):
             raise ProcessingConfigError("不是受支持的 IMGT 图像处理配置文件")
         ipm_data = payload["ipm"]
         colour_data = payload["colour_detection"]
@@ -512,9 +520,21 @@ def load_processing_config(path: str | Path) -> tuple[IpmConfig, ColourDetection
             output_width=int(ipm_data["output_width"]), output_height=int(ipm_data["output_height"]),
             calibration=calibration,
         )
+        if payload["version"] == 1:
+            colours = (
+                DetectionColour("红色", _threshold_from_dict(colour_data["red"]), (255, 63, 63)),
+                DetectionColour("黄色", _threshold_from_dict(colour_data["yellow"]), (255, 214, 10)),
+            )
+        else:
+            colours = tuple(
+                DetectionColour(
+                    str(item["name"]), _threshold_from_dict(item["threshold"]),
+                    tuple(int(channel) for channel in item["preview_rgb"]),
+                )
+                for item in colour_data["colours"]
+            )
         colour = ColourDetectionConfig(
-            red=_threshold_from_dict(colour_data["red"]),
-            yellow=_threshold_from_dict(colour_data["yellow"]),
+            colours=colours,
             roi_top_percent=int(colour_data["roi_top_percent"]),
             roi_left_percent=int(colour_data["roi_left_percent"]),
             roi_right_percent=int(colour_data["roi_right_percent"]),
@@ -571,7 +591,14 @@ def _validate_colour_config(config: ColourDetectionConfig) -> None:
         and 0 < config.maximum_components <= 255
     ):
         raise ProcessingConfigError("颜色检测 ROI 或组件数量范围无效")
-    for threshold in (config.red, config.yellow):
+    if not config.colours or len(config.colours) > 65534:
+        raise ProcessingConfigError("至少保留一种颜色；嵌入式标签编号最多支持 65534 种")
+    for colour in config.colours:
+        if not colour.name.strip() or len(colour.name) > 64:
+            raise ProcessingConfigError("颜色名称不能为空且不得超过 64 字符")
+        if len(colour.preview_rgb) != 3 or any(not 0 <= value <= 255 for value in colour.preview_rgb):
+            raise ProcessingConfigError("预览颜色 RGB 必须为 0–255")
+        threshold = colour.threshold
         if (
             not all(0 <= value <= 240 for value in (
                 threshold.h_min, threshold.h_max, threshold.s_min, threshold.s_max,
@@ -595,10 +622,10 @@ class _ImagePreview(ttk.Frame):
         super().__init__(parent, style="Card.TFrame", padding=(6, 6))
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
-        ttk.Label(self, text=title, style="Section.TLabel", foreground="#93c5fd").grid(
+        ttk.Label(self, text=title, style="Section.TLabel", foreground=ui.MUTED).grid(
             row=0, column=0, sticky="w", pady=(0, 4)
         )
-        self.canvas = tk.Canvas(self, background="#06101f", highlightthickness=0)
+        self.canvas = tk.Canvas(self, background=ui.PLOT, highlightthickness=0)
         self.canvas.grid(row=1, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", lambda _event: self._render())
         self._rgb = b""
@@ -646,10 +673,29 @@ class _DualImagePane(ttk.Frame):
         super().__init__(parent, style="Card.TFrame", padding=(8, 8))
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
-        self.controls = ttk.Frame(self, style="Card.TFrame")
-        self.controls.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        # At laptop height the colour controls are taller than the preview
+        # page.  A bounded scroll area preserves every editor and button while
+        # keeping both image canvases visible.
+        self._control_canvas = tk.Canvas(
+            self, background=ui.SURFACE, highlightthickness=0, borderwidth=0, height=118
+        )
+        self._control_canvas.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        self._control_scrollbar = ttk.Scrollbar(
+            self, orient="vertical", command=self._control_canvas.yview
+        )
+        self._control_scrollbar.grid(row=0, column=1, sticky="ns", pady=(0, 5))
+        self._control_canvas.configure(yscrollcommand=self._control_scrollbar.set)
+        self.controls = ttk.Frame(self._control_canvas, style="Card.TFrame")
+        self._control_window = self._control_canvas.create_window(
+            0, 0, window=self.controls, anchor="nw"
+        )
+        self.controls.bind("<Configure>", self._on_controls_resize)
+        self._control_canvas.bind("<Configure>", self._on_control_viewport_resize)
+        self._control_canvas.bind("<MouseWheel>", self._on_control_wheel)
+        self.bind("<Configure>", self._limit_control_height)
+        self.after_idle(self._bind_control_wheel)
         previews = ttk.Frame(self, style="Card.TFrame")
-        previews.grid(row=1, column=0, sticky="nsew")
+        previews.grid(row=1, column=0, columnspan=2, sticky="nsew")
         previews.columnconfigure(0, weight=1)
         previews.columnconfigure(1, weight=1)
         previews.rowconfigure(0, weight=1)
@@ -657,6 +703,34 @@ class _DualImagePane(ttk.Frame):
         self.original_preview.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self.result_preview = _ImagePreview(previews, result_label)
         self.result_preview.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+    def _on_controls_resize(self, _event: tk.Event) -> None:
+        self._control_canvas.configure(scrollregion=self._control_canvas.bbox("all"))
+
+    def _on_control_viewport_resize(self, event: tk.Event) -> None:
+        self._control_canvas.itemconfigure(self._control_window, width=event.width)
+
+    def _limit_control_height(self, event: tk.Event) -> None:
+        content_height = self.controls.winfo_reqheight()
+        available = max(68, int(event.height * 0.34))
+        target = min(content_height, available)
+        if abs(self._control_canvas.winfo_height() - target) > 1:
+            self._control_canvas.configure(height=target)
+
+    def _bind_control_wheel(self, widget: tk.Misc | None = None) -> None:
+        def bind_descendants(child_widget: tk.Misc) -> None:
+            if not getattr(child_widget, "_control_wheel_bound", False):
+                child_widget.bind("<MouseWheel>", self._on_control_wheel, add="+")
+                child_widget._control_wheel_bound = True
+            for child in child_widget.winfo_children():
+                bind_descendants(child)
+
+        bind_descendants(widget or self.controls)
+
+    def _on_control_wheel(self, event: tk.Event) -> str:
+        if event.delta:
+            self._control_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
 
 
 class IpmPane(_DualImagePane):
@@ -689,7 +763,7 @@ class IpmPane(_DualImagePane):
             self.controls,
             text="参数默认与 CameraIPM.h 一致；标定窗口可编辑全部相机与单应矩阵参数。",
             style="Section.TLabel",
-            foreground="#94a3b8",
+            foreground=ui.MUTED,
         ).grid(row=2, column=1, columnspan=6, sticky="w", pady=(5, 0))
 
     def _add_scale(
@@ -715,7 +789,7 @@ class IpmPane(_DualImagePane):
             command=lambda _value: self._settings_changed(value, variable, pattern),
         )
         scale.grid(row=row, column=column + 1, sticky="ew", padx=(0, 4))
-        ttk.Label(self.controls, textvariable=value, style="Section.TLabel", foreground="#bfdbfe").grid(
+        ttk.Label(self.controls, textvariable=value, style="Section.TLabel", foreground=ui.TEXT).grid(
             row=row, column=column + 2, sticky="e", padx=(0, 8)
         )
 
@@ -765,6 +839,7 @@ class IpmPane(_DualImagePane):
     def _open_calibration_editor(self) -> None:
         window = tk.Toplevel(self)
         window.title("CameraIPM 标定参数")
+        window.configure(background=ui.CANVAS)
         window.minsize(700, 420)
         window.geometry("780x470")
         window.transient(self.winfo_toplevel())
@@ -856,45 +931,61 @@ class IpmPane(_DualImagePane):
         except (tk.TclError, ValueError) as error:
             self.result_preview.canvas.delete("all")
             self.result_preview.canvas.create_text(
-                10, 10, anchor="nw", text=f"逆透视参数无效：{error}", fill="#fb7185"
+                10, 10, anchor="nw", text=f"逆透视参数无效：{error}", fill=ui.ERROR
             )
 
 
 class ColourDetectionPane(_DualImagePane):
-    """Interactive version of the embedded red/yellow HSL detector."""
+    """Interactive HSL and area editors with always-visible colour actions."""
 
     def __init__(self, parent: tk.Misc, on_change: Callable[[], None]) -> None:
         super().__init__(parent, "实时原图", "颜色检测结果")
         self._on_change = on_change
         self._frame: tuple[bytes, int, int] | None = None
         self.info_var = tk.StringVar(value="等待图像")
-        self.red_vars = self._make_threshold_variables((230, 15, 20, 240, 65, 240))
-        self.yellow_vars = self._make_threshold_variables((18, 42, 80, 240, 70, 240))
-        self.red_geometry_vars = self._make_geometry_variables(ColourDetectionConfig().red)
-        self.yellow_geometry_vars = self._make_geometry_variables(ColourDetectionConfig().yellow)
+        self._colour_rows: list[dict] = []
+        self.colour_count_var = tk.StringVar()
+        # Colour actions stay visible above the scrolling threshold editors.
+        self._control_canvas.grid_configure(row=1)
+        self._control_scrollbar.grid_configure(row=1)
+        self.original_preview.master.grid_configure(row=2)
+        self.rowconfigure(1, weight=0)
+        self.rowconfigure(2, weight=1)
+        actions = ttk.Frame(self, style="Card.TFrame")
+        actions.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(actions, text="增加颜色", style="Accent.TButton", command=self._add_colour).grid(
+            row=0, column=0, padx=(0, 6)
+        )
+        self.reduce_colour_button = ttk.Button(actions, text="减少颜色", command=self._reduce_colour)
+        self.reduce_colour_button.grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(actions, textvariable=self.colour_count_var, style="Section.TLabel").grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Label(actions, text="减少颜色移除末项；每项的移除按钮可删除指定颜色。",
+                  style="Section.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
         self.roi_top_var = tk.IntVar(value=25)
         self.roi_left_var = tk.IntVar(value=0)
         self.roi_right_var = tk.IntVar(value=100)
         self.maximum_components_var = tk.IntVar(value=12)
 
-        red_group = self._add_threshold_group("红色 HSL（0–240）", self.red_vars, 0)
-        yellow_group = self._add_threshold_group("黄色 HSL（0–240）", self.yellow_vars, 1)
         generic_group = ttk.LabelFrame(self.controls, text=" 组件过滤 ", padding=(6, 4))
-        generic_group.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        generic_group.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         self._add_spin_field(generic_group, "ROI 顶部 (%)", self.roi_top_var, 0, 95, 0)
         self._add_spin_field(generic_group, "ROI 左侧 (%)", self.roi_left_var, 0, 99, 1)
         self._add_spin_field(generic_group, "ROI 右侧 (%)", self.roi_right_var, 1, 100, 2)
         self._add_spin_field(generic_group, "每色最大组件", self.maximum_components_var, 1, 99, 3)
-        ttk.Label(generic_group, textvariable=self.info_var, foreground="#93c5fd").grid(
+        ttk.Label(generic_group, textvariable=self.info_var, foreground=ui.MUTED).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
         ttk.Button(generic_group, text="完整阈值…", command=self._open_geometry_editor).grid(
             row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0)
         )
+        self.colour_container = ttk.Frame(self.controls, style="Card.TFrame")
+        self.colour_container.grid(row=0, column=0, sticky="ew")
         self.controls.columnconfigure(0, weight=1)
-        self.controls.columnconfigure(1, weight=1)
-        red_group.columnconfigure(1, weight=1)
-        yellow_group.columnconfigure(1, weight=1)
+        self.colour_container.columnconfigure(0, weight=1)
+        for colour in DEFAULT_COLOURS:
+            self._add_colour(colour, notify=False)
 
     @staticmethod
     def _make_threshold_variables(values: tuple[int, int, int, int, int, int]) -> tuple[tk.IntVar, ...]:
@@ -912,14 +1003,83 @@ class ColourDetectionPane(_DualImagePane):
             "aspect_max_permille": tk.IntVar(value=threshold.aspect_max_permille),
         }
 
-    def _add_threshold_group(
-        self, title: str, variables: tuple[tk.IntVar, ...], column: int
-    ) -> ttk.LabelFrame:
-        group = ttk.LabelFrame(self.controls, text=f" {title} ", padding=(6, 4))
-        group.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column == 0 else (0, 0))
-        for row, (label, variable) in enumerate(zip(("H 最小", "H 最大", "S 最小", "S 最大", "L 最小", "L 最大"), variables)):
-            self._add_spin_field(group, label, variable, 0, 240, row)
-        return group
+    def _add_colour(self, colour: DetectionColour | None = None, notify: bool = True) -> None:
+        if colour is None:
+            number = len(self._colour_rows) + 1
+            hue = (number * 47) % 240
+            colour = DetectionColour(
+                f"颜色 {number}", HslThreshold(max(0, hue - 12), min(240, hue + 12), 80, 240, 65, 240),
+                tuple(round(value * 255) for value in colorsys.hls_to_rgb(hue / 240, 0.5, 1.0)),
+            )
+        group = ttk.LabelFrame(self.colour_container, text=f" {colour.name} · HSL（0–240） ", padding=(8, 6))
+        row: dict = {
+            "group": group,
+            "name": tk.StringVar(value=colour.name),
+            "rgb": tk.StringVar(value="#{:02X}{:02X}{:02X}".format(*colour.preview_rgb)),
+            "hsl": self._make_threshold_variables(tuple(getattr(colour.threshold, key) for key in
+                ("h_min", "h_max", "s_min", "s_max", "l_min", "l_max"))),
+            "geometry": self._make_geometry_variables(colour.threshold),
+        }
+        self._colour_rows.append(row)
+        group.grid(row=len(self._colour_rows) - 1, column=0, sticky="ew", pady=(0, 6))
+        for column in range(4):
+            group.columnconfigure(column, weight=1)
+        ttk.Label(group, text="名称", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        name_entry = ttk.Entry(group, textvariable=row["name"], style="Input.TEntry", width=12)
+        name_entry.grid(row=0, column=1, sticky="ew", padx=(3, 9))
+        name_entry.bind("<FocusOut>", lambda _event: self._on_change())
+        name_entry.bind("<Return>", lambda _event: self._on_change())
+        ttk.Label(group, text="标记色 #RRGGBB", style="Section.TLabel").grid(row=0, column=2, sticky="w")
+        rgb_entry = ttk.Entry(group, textvariable=row["rgb"], style="Input.TEntry", width=9)
+        rgb_entry.grid(row=0, column=3, sticky="ew")
+        rgb_entry.bind("<FocusOut>", lambda _event: self._on_change())
+        rgb_entry.bind("<Return>", lambda _event: self._on_change())
+        for index, (label, variable) in enumerate(zip(
+            ("H 最小", "H 最大", "S 最小", "S 最大", "L 最小", "L 最大"), row["hsl"]
+        )):
+            self._add_compact_field(group, label, variable, 0, 240, 1 + index // 2, (index % 2) * 2)
+        self._add_compact_field(group, "最小面积(px)", row["geometry"]["area_min"], 1, 65535, 4, 0)
+        self._add_compact_field(group, "最大面积(px)", row["geometry"]["area_max"], 1, 65535, 4, 2)
+        ttk.Button(group, text="高级阈值…", command=lambda item=row: self._open_geometry_editor(item)).grid(
+            row=5, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=(4, 0)
+        )
+        ttk.Button(group, text="移除", command=lambda item=row: self._remove_colour(item)).grid(
+            row=5, column=2, columnspan=2, sticky="ew", pady=(4, 0)
+        )
+        self._bind_control_wheel(group)
+        self._update_colour_actions()
+        if notify:
+            self._on_change()
+
+    def _update_colour_actions(self) -> None:
+        self.colour_count_var.set(f"当前 {len(self._colour_rows)} 种颜色")
+        self.reduce_colour_button.configure(state="normal" if len(self._colour_rows) > 1 else "disabled")
+
+    def _reduce_colour(self) -> None:
+        if len(self._colour_rows) > 1:
+            self._remove_colour(self._colour_rows[-1])
+
+    def _remove_colour(self, row: dict) -> None:
+        if len(self._colour_rows) == 1:
+            messagebox.showwarning("颜色检测", "至少保留一种颜色。", parent=self)
+            return
+        row["group"].destroy()
+        self._colour_rows.remove(row)
+        for index, item in enumerate(self._colour_rows):
+            item["group"].grid_configure(row=index)
+        self._update_colour_actions()
+        self._on_change()
+
+    def _add_compact_field(
+        self, parent: tk.Misc, label: str, variable: tk.IntVar,
+        minimum: int, maximum: int, row: int, column: int,
+    ) -> None:
+        ttk.Label(parent, text=label, style="Section.TLabel").grid(row=row, column=column, sticky="w", pady=2)
+        spin = ttk.Spinbox(parent, from_=minimum, to=maximum, width=7, textvariable=variable,
+                           command=self._on_change, style="Input.TSpinbox")
+        spin.grid(row=row, column=column + 1, sticky="ew", padx=(3, 9), pady=2)
+        spin.bind("<FocusOut>", lambda _event: self._on_change())
+        spin.bind("<Return>", lambda _event: self._on_change())
 
     def _add_spin_field(
         self, parent: tk.Misc, label: str, variable: tk.IntVar, minimum: int, maximum: int, row: int
@@ -948,9 +1108,19 @@ class ColourDetectionPane(_DualImagePane):
         )
 
     def get_config(self) -> ColourDetectionConfig:
+        colours = []
+        for row in self._colour_rows:
+            rgb_text = row["rgb"].get().strip().lstrip("#")
+            if len(rgb_text) != 6:
+                raise ProcessingConfigError("标记色必须是 #RRGGBB 格式")
+            try:
+                rgb = tuple(int(rgb_text[index:index + 2], 16) for index in (0, 2, 4))
+            except ValueError as error:
+                raise ProcessingConfigError("标记色必须是 #RRGGBB 格式") from error
+            colours.append(DetectionColour(row["name"].get().strip(),
+                                           self._threshold(row["hsl"], row["geometry"]), rgb))
         return ColourDetectionConfig(
-            red=self._threshold(self.red_vars, self.red_geometry_vars),
-            yellow=self._threshold(self.yellow_vars, self.yellow_geometry_vars),
+            colours=tuple(colours),
             roi_top_percent=max(0, min(100, int(self.roi_top_var.get()))),
             roi_left_percent=max(0, min(100, int(self.roi_left_var.get()))),
             roi_right_percent=max(0, min(100, int(self.roi_right_var.get()))),
@@ -959,8 +1129,11 @@ class ColourDetectionPane(_DualImagePane):
 
     def apply_config(self, config: ColourDetectionConfig) -> None:
         _validate_colour_config(config)
-        self._set_threshold_variables(self.red_vars, self.red_geometry_vars, config.red)
-        self._set_threshold_variables(self.yellow_vars, self.yellow_geometry_vars, config.yellow)
+        for row in self._colour_rows:
+            row["group"].destroy()
+        self._colour_rows.clear()
+        for colour in config.colours:
+            self._add_colour(colour, notify=False)
         self.roi_top_var.set(config.roi_top_percent)
         self.roi_left_var.set(config.roi_left_percent)
         self.roi_right_var.set(config.roi_right_percent)
@@ -979,18 +1152,21 @@ class ColourDetectionPane(_DualImagePane):
         for key in geometry_variables:
             geometry_variables[key].set(getattr(threshold, key))
 
-    def _open_geometry_editor(self) -> None:
+    def _open_geometry_editor(self, selected: dict | None = None) -> None:
+        if selected is None:
+            selected = self._colour_rows[0]
         window = tk.Toplevel(self)
         window.title("ColorDetection 完整组件阈值")
-        window.minsize(540, 320)
-        window.geometry("610x360")
+        window.configure(background=ui.CANVAS)
+        window.minsize(330, 320)
+        window.geometry("400x390")
         window.transient(self.winfo_toplevel())
         window.columnconfigure(0, weight=1)
         window.rowconfigure(0, weight=1)
         content = ttk.Frame(window, style="Card.TFrame", padding=(12, 10))
         content.grid(row=0, column=0, sticky="nsew")
         content.columnconfigure(0, weight=1)
-        content.columnconfigure(1, weight=1)
+        content.columnconfigure(0, weight=1)
         labels = (
             ("area_min", "最小面积"), ("area_max", "最大面积"),
             ("width_min", "最小宽度"), ("height_min", "最小高度"),
@@ -998,29 +1174,29 @@ class ColourDetectionPane(_DualImagePane):
             ("aspect_min_permille", "最小纵横比‰"),
             ("aspect_max_permille", "最大纵横比‰"),
         )
-        edit_vars: dict[str, tuple[tk.StringVar, tk.StringVar]] = {}
-        for column, (title, geometry) in enumerate((("红色", self.red_geometry_vars), ("黄色", self.yellow_geometry_vars))):
-            group = ttk.LabelFrame(content, text=f" {title}组件过滤 ", padding=(8, 6))
-            group.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column == 0 else (0, 0))
-            group.columnconfigure(1, weight=1)
-            for row, (key, label) in enumerate(labels):
-                red_var = tk.StringVar(value=str(geometry[key].get()))
-                edit_vars.setdefault(key, (red_var, tk.StringVar()))
-                if column == 1:
-                    edit_vars[key] = (edit_vars[key][0], red_var)
-                ttk.Label(group, text=label, style="Section.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 5), pady=2)
-                ttk.Entry(group, textvariable=red_var, style="Input.TEntry", width=10).grid(row=row, column=1, sticky="ew", pady=2)
+        edit_vars: dict[str, tk.StringVar] = {}
+        group = ttk.LabelFrame(content, text=f" {selected['name'].get()}组件过滤 ", padding=(8, 6))
+        group.grid(row=0, column=0, sticky="nsew")
+        group.columnconfigure(1, weight=1)
+        for index, (key, label) in enumerate(labels):
+            variable = tk.StringVar(value=str(selected["geometry"][key].get()))
+            edit_vars[key] = variable
+            ttk.Label(group, text=label, style="Section.TLabel").grid(row=index, column=0, sticky="w", padx=(0, 5), pady=2)
+            ttk.Entry(group, textvariable=variable, style="Input.TEntry", width=10).grid(row=index, column=1, sticky="ew", pady=2)
 
         actions = ttk.Frame(content, style="Card.TFrame")
-        actions.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        actions.grid(row=1, column=0, sticky="e", pady=(10, 0))
 
         def apply() -> None:
+            previous = {key: variable.get() for key, variable in selected["geometry"].items()}
             try:
-                for key, values in edit_vars.items():
-                    self.red_geometry_vars[key].set(int(values[0].get()))
-                    self.yellow_geometry_vars[key].set(int(values[1].get()))
+                parsed = {key: int(variable.get()) for key, variable in edit_vars.items()}
+                for key, value in parsed.items():
+                    selected["geometry"][key].set(value)
                 _validate_colour_config(self.get_config())
             except (tk.TclError, ValueError, ProcessingConfigError) as error:
+                for key, value in previous.items():
+                    selected["geometry"][key].set(value)
                 messagebox.showerror("颜色阈值无效", str(error), parent=window)
                 return
             self._on_change()
@@ -1044,6 +1220,8 @@ class ColourDetectionPane(_DualImagePane):
             _validate_colour_config(config)
             result = detect_colours(rgb, width, height, config)
             self.result_preview.set_image(result.image, width, height)
-            self.info_var.set(f"红色 {result.red_components} 个 · 黄色 {result.yellow_components} 个")
+            self.info_var.set(" · ".join(
+                f"{colour.name} {count} 个" for colour, count in zip(config.colours, result.component_counts)
+            ))
         except (tk.TclError, ValueError) as error:
             self.info_var.set(f"参数无效：{error}")

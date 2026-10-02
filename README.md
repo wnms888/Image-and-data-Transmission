@@ -8,13 +8,13 @@
 EmbedCode/
   WifiImageTransfer.c/.h   嵌入式 WiFi 图像、日志帧与 Printf 接口
   CameraIPM.c/.h           共享标定的像素/地面坐标逆透视映射
-  ColorDetection.c/.h      共享阈值的红黄 HSL 颜色检测
+  ColorDetection.c/.h      可配置颜色列表的 HSL 检测
   TC4ImageProcessingConfig.h 上位机导出的唯一嵌入式图像处理配置文件
 HostApp/
   monitor.py               可缩放图形化上位机
   protocol.py              IMGT v1 分帧、校验、RGB565 解码和 PNG 编码
   oscilloscope.py          通过校验的数值日志多通道示波器
-  image_processing.py      逆透视与红黄 HSL 检测实时预览
+  image_processing.py      逆透视与多颜色 HSL 检测实时预览
   receiver.py              TCP 监听/客户端、串口接收
   frame_saver.py           后台 PNG 单帧/连续帧保存
   启动上位机.bat           Windows 推荐启动入口
@@ -82,7 +82,7 @@ netsh advfirewall show currentprofile
 “实时图像”面板还提供两个不影响原始接收/保存图像的上位机处理页：
 
 - **逆透视**：默认完整匹配 `CameraIPM.h` 的图像尺寸、内参、径向/切向畸变和单应矩阵；可调俯视范围/输出尺寸，也可在“标定参数”窗口修改全部标定值。
-- **颜色检测**：默认完整匹配 `ColorDetection.c` 的红黄 HSL 阈值、ROI、面积、宽高、填充率、纵横比和每色最大组件数；主界面和“完整阈值”窗口均可调整。
+- **颜色检测**：顶部固定提供“增加颜色”和“减少颜色”按钮，默认提供红、黄两项，也可任意新增或移除颜色规则。每项独立设置名称、标记色、HSL 六个阈值和面积上下限，均可在页面内直接输入；“高级阈值”可继续设置宽高、填充率和纵横比。按列表顺序匹配，重叠阈值由排在前面的颜色优先。ROI 和每色最大组件数仍可调整；蓝色等任意色相均可检测。
 
 “导出配置（JSON + C）”会保存可再次导入上位机的 UTF-8 JSON，并生成可直接覆盖到嵌入式工程的完整 C 头文件；“导入处理配置”读取 JSON 恢复两页参数。
 
@@ -128,9 +128,9 @@ printf("[warning] channel_data: %d, %d, %d, %d\n", 12, 13, 14, 15);
 
 “实时图像”标题栏的“导出配置（JSON + C）”会同时生成三份内容：用于再次导入上位机的 JSON、与 JSON 同目录的 `*_embedded_config.h`，以及项目内已同步更新的 [EmbedCode/TC4ImageProcessingConfig.h](EmbedCode/TC4ImageProcessingConfig.h)。C 文件是完整头文件，不是零散参数片段。
 
-首次接入时，将本仓库更新后的 `CameraIPM.c/.h`、`ColorDetection.c/.h` 和 `TC4ImageProcessingConfig.h` 放入嵌入式工程并重新编译。此后每次在上位机调整逆透视或红黄颜色检测参数，只需点击导出、把导出的 `TC4ImageProcessingConfig.h` 整个覆盖到嵌入式工程同名文件，然后重新编译；不需要再修改任何 C 源文件。
+首次接入时，将本仓库更新后的 `CameraIPM.c/.h`、`ColorDetection.c/.h` 和 `TC4ImageProcessingConfig.h` 放入嵌入式工程并重新编译。新版 `ColorDetectionResult` 使用 `colours[i].count` 和 `colours[i].cones[j]` 表示导出列表中第 `i` 种颜色（从 0 开始），替代旧的 `red_count/yellow_count` 和 `red/yellow` 数组；旧工程中引用这些字段的位置需一次性更新。此后每次在上位机增减颜色或调整逆透视、颜色阈值，只需点击导出、把导出的 `TC4ImageProcessingConfig.h` 整个覆盖到嵌入式工程同名文件，然后重新编译；不需要再修改任何 C 源文件。JSON 配置已升级为 v2，仍可导入旧版 v1 红黄配置。
 
-该文件同步相机标定参考尺寸、内参、畸变、单应矩阵、鸟瞰图范围和尺寸，以及红黄 HSL、几何过滤、ROI 百分比和每色最大组件数。嵌入式端会按 SCC8660 实际尺寸换算标定坐标，颜色 ROI 也按百分比换算，因此与上位机预览采用同一组定义。`Camera_GetIpmViewConfig()` 可直接取得导出的鸟瞰图范围；`Camera_GroundToRawPixel()` 和 `Camera_RawPixelToGround()` 使用同一份标定。
+该文件同步相机标定参考尺寸、内参、畸变、单应矩阵、鸟瞰图范围和尺寸，以及有序颜色列表的 HSL/最小面积等几何阈值、ROI 百分比和每色最大组件数。嵌入式端会按 SCC8660 实际尺寸换算标定坐标，颜色 ROI 也按百分比换算，因此与上位机预览采用同一组定义。`Camera_GetIpmViewConfig()` 可直接取得导出的鸟瞰图范围；`Camera_GroundToRawPixel()` 和 `Camera_RawPixelToGround()` 使用同一份标定。
 
 ## 数据帧
 

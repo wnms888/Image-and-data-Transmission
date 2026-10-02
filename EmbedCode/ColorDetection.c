@@ -1,22 +1,29 @@
 /*
  * ColorDetection.c
  *
- * One-pass red/yellow color classification + connected components + CameraIPM.
+ * Ordered HSL classification + connected components + CameraIPM.
  */
 
 #include "Header.h"
 #include "ColorDetection.h"
 #include "CameraIPM.h"
 
-#define CD_LABEL_NONE       ((uint8)COLOR_DETECTION_NONE)
-#define CD_LABEL_RED        ((uint8)COLOR_DETECTION_RED)
-#define CD_LABEL_YELLOW     ((uint8)COLOR_DETECTION_YELLOW)
-#define CD_LABEL_WHITE      ((uint8)3u)
+#define CD_LABEL_NONE       ((CdLabel)0u)
+#if COLOR_DETECTION_COLOR_COUNT < 255u
+typedef uint8 CdLabel;
+#define CD_LABEL_WHITE      ((CdLabel)255u)
+#else
+typedef uint16 CdLabel;
+#define CD_LABEL_WHITE      ((CdLabel)65535u)
+#endif
+#if COLOR_DETECTION_COLOR_COUNT < 1u || COLOR_DETECTION_COLOR_COUNT > 65534u
+#error COLOR_DETECTION_COLOR_COUNT must be between 1 and 65534
+#endif
 
 #define CD_IMAGE_PIXELS     ((uint32)SCC8660_W * (uint32)SCC8660_H)
 
-/* One byte per pixel. The map is consumed by flood fill, so no visit_mask is needed. */
-static uint8 s_label_map[SCC8660_H][SCC8660_W];
+/* One or two bytes per pixel according to the exported colour count. */
+static CdLabel s_label_map[SCC8660_H][SCC8660_W];
 
 /* x < 256 and y < 256, therefore one uint16 can pack both coordinates:
  * high byte = y, low byte = x.
@@ -31,29 +38,9 @@ static uint16 s_row_count[SCC8660_H];
 static uint16 s_frame_copy[SCC8660_H][SCC8660_W];
 #endif
 
-/* Conservative thresholds for the 1.5 m guidance window. Ground stains are
- * typically lower in saturation/brightness, sparse inside their bounding
- * box, or wider than tall; all of those properties are rejected below. */
-ColorDetectionThreshold g_color_detection_red_threshold =
+ColorDetectionThreshold g_color_detection_thresholds[COLOR_DETECTION_COLOR_COUNT] =
 {
-    TC4_CFG_RED_H_MIN, TC4_CFG_RED_H_MAX,
-    TC4_CFG_RED_S_MIN, TC4_CFG_RED_S_MAX,
-    TC4_CFG_RED_L_MIN, TC4_CFG_RED_L_MAX,
-    TC4_CFG_RED_AREA_MIN, TC4_CFG_RED_AREA_MAX,
-    TC4_CFG_RED_WIDTH_MIN, TC4_CFG_RED_HEIGHT_MIN,
-    TC4_CFG_RED_FILL_MIN_PERMILLE,
-    TC4_CFG_RED_ASPECT_MIN_PERMILLE, TC4_CFG_RED_ASPECT_MAX_PERMILLE
-};
-
-ColorDetectionThreshold g_color_detection_yellow_threshold =
-{
-    TC4_CFG_YELLOW_H_MIN, TC4_CFG_YELLOW_H_MAX,
-    TC4_CFG_YELLOW_S_MIN, TC4_CFG_YELLOW_S_MAX,
-    TC4_CFG_YELLOW_L_MIN, TC4_CFG_YELLOW_L_MAX,
-    TC4_CFG_YELLOW_AREA_MIN, TC4_CFG_YELLOW_AREA_MAX,
-    TC4_CFG_YELLOW_WIDTH_MIN, TC4_CFG_YELLOW_HEIGHT_MIN,
-    TC4_CFG_YELLOW_FILL_MIN_PERMILLE,
-    TC4_CFG_YELLOW_ASPECT_MIN_PERMILLE, TC4_CFG_YELLOW_ASPECT_MAX_PERMILLE
+    TC4_CFG_COLOR_THRESHOLDS
 };
 
 typedef struct
@@ -191,22 +178,6 @@ static uint8 cd_hsl_match(
         (l >= t->l_min) && (l <= t->l_max));
 }
 
-/* Extremely cheap reject for obvious blue/neutral background.
- *
- * Red needs R to dominate at least B.
- * Yellow needs both R and G to dominate B.
- * If B is >= both R and G, the pixel cannot be a useful red/yellow candidate
- * for this detector, so skip the HSL divisions.
- */
-static uint8 cd_fast_red_yellow_candidate(uint8 r, uint8 g, uint8 b)
-{
-    if ((b >= r) && (b >= g))
-    {
-        return 0u;
-    }
-    return 1u;
-}
-
 static uint8 cd_is_white_sign_candidate(uint8 r, uint8 g, uint8 b)
 {
     const uint8 maxc = cd_max3(r, g, b);
@@ -217,7 +188,7 @@ static uint8 cd_is_white_sign_candidate(uint8 r, uint8 g, uint8 b)
         ((uint8)(maxc - minc) <= COLOR_DETECTION_WHITE_MAX_CHROMA));
 }
 
-static uint8 cd_classify_pixel(uint16 raw_rgb565, ColorDetectionResult *result)
+static CdLabel cd_classify_pixel(uint16 raw_rgb565, ColorDetectionResult *result)
 {
     uint8 r;
     uint8 g;
@@ -225,26 +196,18 @@ static uint8 cd_classify_pixel(uint16 raw_rgb565, ColorDetectionResult *result)
     uint8 h;
     uint8 s;
     uint8 l;
+    uint16 colour_index;
 
     cd_rgb565_to_rgb888(raw_rgb565, &r, &g, &b);
 
-    if (!cd_fast_red_yellow_candidate(r, g, b))
-    {
-        result->fast_rejected_pixels++;
-        return CD_LABEL_NONE;
-    }
-
     cd_rgb_to_hsl240(r, g, b, &h, &s, &l);
     result->hsl_conversions++;
-
-    if (cd_hsl_match(h, s, l, &g_color_detection_red_threshold))
+    for (colour_index = 0u; colour_index < COLOR_DETECTION_COLOR_COUNT; ++colour_index)
     {
-        return CD_LABEL_RED;
-    }
-
-    if (cd_hsl_match(h, s, l, &g_color_detection_yellow_threshold))
-    {
-        return CD_LABEL_YELLOW;
+        if (cd_hsl_match(h, s, l, &g_color_detection_thresholds[colour_index]))
+        {
+            return (CdLabel)(colour_index + 1u);
+        }
     }
 
     return CD_LABEL_NONE;
@@ -258,7 +221,7 @@ static void cd_build_label_map(
     uint16 x;
 
     /* Explicitly clear outside/previous ROI labels.
-     * 20 KB at 160x128; deterministic and safer when ROI changes.
+     * Deterministic and safer when ROI changes.
      */
     memset(s_label_map, 0, sizeof(s_label_map));
 
@@ -294,7 +257,7 @@ static uint16 cd_unpack_y(uint16 packed)
 static void cd_enqueue_if_same_label(
     int nx,
     int ny,
-    uint8 label,
+    CdLabel label,
     uint32 *tail)
 {
     if ((nx < (int)COLOR_DETECTION_ROI_X_MIN) ||
@@ -324,7 +287,7 @@ static void cd_enqueue_if_same_label(
 static uint8 cd_flood_fill(
     uint16 sx,
     uint16 sy,
-    uint8 label,
+    CdLabel label,
     CdBlobStats *stats)
 {
     uint32 head = 0u;
@@ -483,7 +446,7 @@ static void cd_extract_bottom_contact(
 }
 
 static void cd_store_blob(
-    uint8 label,
+    CdLabel label,
     const CdBlobStats *stats,
     uint16 width,
     uint16 height,
@@ -496,28 +459,16 @@ static void cd_store_blob(
     uint16 u;
     uint16 v;
 
-    if (label == CD_LABEL_RED)
-    {
-        if (result->red_count >= COLOR_DETECTION_MAX_CONES)
-        {
-            return;
-        }
-        cone = &result->red[result->red_count++];
-        cone->color = COLOR_DETECTION_RED;
-    }
-    else if (label == CD_LABEL_YELLOW)
-    {
-        if (result->yellow_count >= COLOR_DETECTION_MAX_CONES)
-        {
-            return;
-        }
-        cone = &result->yellow[result->yellow_count++];
-        cone->color = COLOR_DETECTION_YELLOW;
-    }
-    else
+    if ((label == CD_LABEL_NONE) || (label > COLOR_DETECTION_COLOR_COUNT))
     {
         return;
     }
+    if (result->colours[label - 1u].count >= COLOR_DETECTION_MAX_CONES)
+    {
+        return;
+    }
+    cone = &result->colours[label - 1u].cones[result->colours[label - 1u].count++];
+    cone->color_index = (uint16)(label - 1u);
 
     cd_extract_bottom_contact(stats, &u, &v);
 
@@ -559,9 +510,9 @@ static void cd_scan_components(ColorDetectionResult *result)
              x <= COLOR_DETECTION_ROI_X_MAX;
              ++x)
         {
-            const uint8 label = s_label_map[y][x];
+            const CdLabel label = s_label_map[y][x];
 
-            if ((label == CD_LABEL_RED) || (label == CD_LABEL_YELLOW))
+            if ((label != CD_LABEL_NONE) && (label <= COLOR_DETECTION_COLOR_COUNT))
             {
                 CdBlobStats stats;
                 const ColorDetectionThreshold *t;
@@ -577,9 +528,7 @@ static void cd_scan_components(ColorDetectionResult *result)
                     continue;
                 }
 
-                t = (label == CD_LABEL_RED) ?
-                    &g_color_detection_red_threshold :
-                    &g_color_detection_yellow_threshold;
+                t = &g_color_detection_thresholds[label - 1u];
 
                 if (!cd_blob_passes_geometry(
                         &stats, t,
@@ -711,7 +660,7 @@ void ColorDetection_Init(void)
 #endif
 }
 
-uint8 ColorDetection_ProcessImage(
+uint32 ColorDetection_ProcessImage(
     const uint16 image[SCC8660_H][SCC8660_W],
     ColorDetectionResult *result)
 {
@@ -726,7 +675,15 @@ uint8 ColorDetection_ProcessImage(
     cd_scan_components(result);
     cd_detect_large_white_region(image, result);
 
-    return (uint8)(result->red_count + result->yellow_count);
+    {
+        uint16 colour_index;
+        uint32 total = 0u;
+        for (colour_index = 0u; colour_index < COLOR_DETECTION_COLOR_COUNT; ++colour_index)
+        {
+            total += result->colours[colour_index].count;
+        }
+        return total;
+    }
 }
 
 uint8 ColorDetection_ProcessCameraFrame(ColorDetectionResult *result)

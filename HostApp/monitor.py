@@ -38,6 +38,7 @@ from protocol import (
     rgb888_to_ppm,
 )
 from receiver import InputWorker, available_serial_ports
+import theme as ui
 
 
 TRANSPORTS = {
@@ -72,9 +73,10 @@ class LogPane(ttk.Frame):
             highlightthickness=0,
             padx=10,
             pady=8,
-            background="#111c31",
-            foreground="#dbeafe",
-            insertbackground="#dbeafe",
+            background=ui.PLOT,
+            foreground=ui.TEXT,
+            insertbackground=ui.TEXT,
+            selectbackground=ui.BLUE_DARK,
             font=("Microsoft YaHei UI", 10),
             state="disabled",
         )
@@ -166,171 +168,224 @@ class ImageTransmissionApp:
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        self.root.configure(background="#0b1220")
-        style.configure("TFrame", background="#0b1220")
-        style.configure("Card.TFrame", background="#111c31")
-        style.configure("TLabelframe", background="#111c31", foreground="#dbeafe")
-        style.configure("TLabelframe.Label", background="#111c31", foreground="#93c5fd", font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("TLabel", background="#0b1220", foreground="#dbeafe", font=("Microsoft YaHei UI", 10))
-        style.configure("Section.TLabel", background="#111c31", font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("TButton", padding=(12, 7), font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff")
-        style.map("Accent.TButton", background=[("active", "#1d4ed8")])
-        # Explicit dark readonly fields avoid Windows' default white combobox
-        # background, which is too close to the light text used by this theme.
+        self.root.configure(background=ui.CANVAS)
+        body_font = ("Microsoft YaHei UI", 10)
+        action_font = ("Microsoft YaHei UI", 10, "bold")
+        style.configure("TFrame", background=ui.SURFACE)
+        style.configure("Card.TFrame", background=ui.SURFACE)
+        style.configure("Header.TFrame", background=ui.CANVAS)
+        style.configure("Footer.TFrame", background=ui.CANVAS)
+        style.configure(
+            "TLabelframe", background=ui.SURFACE, foreground=ui.TEXT,
+            bordercolor=ui.HAIRLINE, lightcolor=ui.HAIRLINE,
+            darkcolor=ui.HAIRLINE, borderwidth=1, relief="solid",
+        )
+        style.configure(
+            "TLabelframe.Label", background=ui.SURFACE, foreground=ui.TEXT,
+            font=("Microsoft YaHei UI", 11, "bold"), padding=(6, 0),
+        )
+        style.configure("TLabel", background=ui.SURFACE, foreground=ui.TEXT, font=body_font)
+        style.configure("Section.TLabel", background=ui.SURFACE, foreground=ui.TEXT, font=action_font)
+        style.configure("Header.TLabel", background=ui.CANVAS, foreground=ui.TEXT, font=body_font)
+        style.configure("Footer.TLabel", background=ui.CANVAS, foreground=ui.MUTED, font=("Microsoft YaHei UI", 9))
+        style.configure(
+            "TButton", background=ui.SURFACE_RAISED, foreground=ui.TEXT,
+            bordercolor=ui.HAIRLINE, lightcolor=ui.HAIRLINE,
+            darkcolor=ui.HAIRLINE, relief="flat", borderwidth=1,
+            padding=(10, 5), font=action_font,
+        )
+        style.map(
+            "TButton", background=[("pressed", ui.FIELD), ("active", ui.FIELD), ("disabled", ui.SURFACE)],
+            foreground=[("disabled", ui.FAINT)], bordercolor=[("focus", ui.BLUE), ("active", ui.MUTED)],
+        )
+        style.configure("Compact.TButton", padding=(6, 5), font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure(
+            "Accent.TButton", background=ui.BLUE, foreground=ui.TEXT,
+            bordercolor=ui.BLUE, lightcolor=ui.BLUE, darkcolor=ui.BLUE,
+        )
+        style.map(
+            "Accent.TButton", background=[("pressed", ui.BLUE_DARK), ("active", ui.BLUE_HOVER), ("disabled", ui.SURFACE_RAISED)],
+            foreground=[("disabled", ui.FAINT)], bordercolor=[("focus", ui.TEXT), ("active", ui.BLUE_HOVER)],
+        )
         style.configure(
             "Input.TEntry",
-            fieldbackground="#172554",
-            foreground="#f8fafc",
-            insertcolor="#f8fafc",
-            padding=6,
+            fieldbackground=ui.FIELD, background=ui.FIELD, foreground=ui.TEXT,
+            insertcolor=ui.TEXT, bordercolor=ui.HAIRLINE, lightcolor=ui.HAIRLINE,
+            darkcolor=ui.HAIRLINE, padding=6, font=body_font,
         )
         style.configure(
             "Input.TSpinbox",
-            fieldbackground="#172554",
-            background="#172554",
-            foreground="#f8fafc",
-            arrowcolor="#bfdbfe",
-            padding=4,
+            fieldbackground=ui.FIELD, background=ui.FIELD, foreground=ui.TEXT,
+            arrowcolor=ui.MUTED, bordercolor=ui.HAIRLINE,
+            lightcolor=ui.HAIRLINE, darkcolor=ui.HAIRLINE, padding=4,
         )
         style.map(
             "Input.TSpinbox",
-            fieldbackground=[("readonly", "#172554"), ("disabled", "#1e293b")],
-            foreground=[("disabled", "#94a3b8")],
+            fieldbackground=[("readonly", ui.FIELD), ("disabled", ui.SURFACE_RAISED)],
+            foreground=[("disabled", ui.FAINT)],
         )
         style.configure(
             "Input.TCombobox",
-            fieldbackground="#172554",
-            background="#172554",
-            foreground="#f8fafc",
-            arrowcolor="#bfdbfe",
-            padding=5,
+            fieldbackground=ui.FIELD, background=ui.FIELD, foreground=ui.TEXT,
+            arrowcolor=ui.MUTED, bordercolor=ui.HAIRLINE,
+            lightcolor=ui.HAIRLINE, darkcolor=ui.HAIRLINE, padding=5,
         )
         style.map(
             "Input.TCombobox",
-            fieldbackground=[("readonly", "#172554"), ("disabled", "#1e293b")],
-            background=[("readonly", "#172554")],
-            foreground=[("readonly", "#f8fafc"), ("disabled", "#94a3b8")],
-            selectbackground=[("readonly", "#1d4ed8")],
-            selectforeground=[("readonly", "#ffffff")],
+            fieldbackground=[("readonly", ui.FIELD), ("disabled", ui.SURFACE_RAISED)],
+            background=[("readonly", ui.FIELD), ("active", ui.SURFACE_RAISED)],
+            foreground=[("readonly", ui.TEXT), ("disabled", ui.FAINT)],
+            selectbackground=[("readonly", ui.BLUE)], selectforeground=[("readonly", ui.TEXT)],
         )
-        style.configure("TNotebook", background="#111c31", borderwidth=0)
+        self.root.option_add("*TCombobox*Listbox.background", ui.FIELD)
+        self.root.option_add("*TCombobox*Listbox.foreground", ui.TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ui.BLUE)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", ui.TEXT)
+        style.configure("TNotebook", background=ui.SURFACE, borderwidth=0, tabmargins=(0, 4, 0, 0))
         style.configure(
             "TNotebook.Tab",
-            background="#172554",
-            foreground="#bfdbfe",
-            padding=(12, 6),
+            background=ui.SURFACE,
+            foreground=ui.MUTED,
+            padding=(15, 8),
             font=("Microsoft YaHei UI", 10, "bold"),
         )
         style.map(
             "TNotebook.Tab",
-            background=[("selected", "#2563eb"), ("active", "#1e3a8a")],
-            foreground=[("selected", "#ffffff")],
+            background=[("selected", ui.SURFACE_RAISED), ("active", ui.FIELD)],
+            foreground=[("selected", ui.TEXT), ("active", ui.TEXT)],
         )
-        style.configure("TCheckbutton", background="#111c31", foreground="#dbeafe")
+        style.configure("TCheckbutton", background=ui.SURFACE, foreground=ui.TEXT, font=body_font)
         style.map(
             "TCheckbutton",
-            background=[("active", "#111c31")],
-            foreground=[("disabled", "#64748b")],
+            background=[("active", ui.SURFACE)], foreground=[("disabled", ui.FAINT)],
         )
-        style.configure("Connected.TLabel", foreground="#5eead4", font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("Disconnected.TLabel", foreground="#fbbf24", font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Connected.TLabel", background=ui.CANVAS, foreground=ui.SUCCESS, font=action_font)
+        style.configure("Disconnected.TLabel", background=ui.CANVAS, foreground=ui.WARNING, font=action_font)
+        style.configure("TScale", background=ui.SURFACE, troughcolor=ui.FIELD, bordercolor=ui.SURFACE)
+        style.configure("TPanedwindow", background=ui.CANVAS)
+        style.configure("Sash", sashthickness=6, background=ui.CANVAS)
+        style.configure("Vertical.TScrollbar", background=ui.SURFACE_RAISED, troughcolor=ui.SURFACE, arrowcolor=ui.MUTED)
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1)
 
-        header = ttk.Frame(self.root, style="Card.TFrame", padding=(18, 12))
-        header.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
+        header = ttk.Frame(self.root, style="Header.TFrame", padding=(6, 7))
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(8, 5))
         header.columnconfigure(1, weight=1)
-        ttk.Label(header, text="IMGT", style="Section.TLabel", font=("Microsoft YaHei UI", 18, "bold"), foreground="#60a5fa").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text="图像传输与 Printf 调试监视器", style="Section.TLabel", foreground="#cbd5e1").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(
+            header, text="IMGT", style="Header.TLabel",
+            font=("Bahnschrift", 21, "bold"), foreground=ui.TEXT,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header, text="图像传输与 Printf 调试监视器", style="Header.TLabel",
+            foreground=ui.MUTED,
+        ).grid(row=0, column=1, sticky="w", padx=(16, 0))
         self.status_label = ttk.Label(header, textvariable=self.status_var, style="Disconnected.TLabel")
         self.status_label.grid(row=0, column=2, sticky="e")
 
-        connection = ttk.LabelFrame(self.root, text=" 输入配置 ", padding=(14, 10))
-        connection.grid(row=1, column=0, sticky="new", padx=14)
-        for column in (1, 3, 5):
-            connection.columnconfigure(column, weight=1)
-        ttk.Label(connection, text="输入方式").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
+        connection = ttk.LabelFrame(self.root, text=" 输入配置 ", padding=(12, 8))
+        connection.grid(row=1, column=0, sticky="ew", padx=14)
+        connection.columnconfigure(0, weight=1)
+
+        source_row = ttk.Frame(connection, style="Card.TFrame")
+        source_row.grid(row=0, column=0, sticky="ew")
+        source_row.columnconfigure(1, weight=2)
+        source_row.columnconfigure(3, weight=2)
+        source_row.columnconfigure(5, weight=1)
+        ttk.Label(source_row, text="输入方式").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
         self.transport_box = ttk.Combobox(
-            connection,
+            source_row,
             textvariable=self.transport_var,
             state="readonly",
             values=list(TRANSPORTS),
-            width=24,
+            width=22,
             style="Input.TCombobox",
         )
-        self.transport_box.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=4)
+        self.transport_box.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=2)
         self.transport_box.bind("<<ComboboxSelected>>", lambda _event: self._on_transport_change())
-        ttk.Label(connection, textvariable=self.endpoint_label_var).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
+        ttk.Label(source_row, textvariable=self.endpoint_label_var).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
         self.endpoint_box = ttk.Combobox(
-            connection, textvariable=self.endpoint_var, width=22, style="Input.TCombobox"
+            source_row, textvariable=self.endpoint_var, width=20, style="Input.TCombobox"
         )
-        self.endpoint_box.grid(row=0, column=3, sticky="ew", padx=(0, 14), pady=4)
-        ttk.Label(connection, textvariable=self.port_label_var).grid(row=0, column=4, sticky="w", padx=(0, 6), pady=4)
+        self.endpoint_box.grid(row=0, column=3, sticky="ew", padx=(0, 12), pady=2)
+        ttk.Label(source_row, textvariable=self.port_label_var).grid(row=0, column=4, sticky="w", padx=(0, 6), pady=4)
         self.port_entry = ttk.Entry(
-            connection, textvariable=self.port_var, width=12, style="Input.TEntry"
+            source_row, textvariable=self.port_var, width=9, style="Input.TEntry"
         )
-        self.port_entry.grid(row=0, column=5, sticky="ew", padx=(0, 8), pady=4)
-        self.refresh_button = ttk.Button(connection, text="刷新串口", command=self._refresh_ports)
-        self.refresh_button.grid(row=0, column=6, sticky="e", pady=4)
+        self.port_entry.grid(row=0, column=5, sticky="ew", padx=(0, 10), pady=2)
+        self.refresh_button = ttk.Button(source_row, text="刷新串口", command=self._refresh_ports)
+        self.refresh_button.grid(row=0, column=6, sticky="e", padx=(0, 8), pady=2)
+        self.connect_button = ttk.Button(source_row, text="开始接收", style="Accent.TButton", command=self.toggle_connection)
+        self.connect_button.grid(row=0, column=7, sticky="e", pady=2)
 
-        ttk.Label(connection, text="解析协议").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(10, 2))
+        format_row = ttk.Frame(connection, style="Card.TFrame")
+        format_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        format_row.columnconfigure(1, weight=1)
+        format_row.columnconfigure(3, weight=2)
+        ttk.Label(format_row, text="解析协议").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
         self.protocol_box = ttk.Combobox(
-            connection,
+            format_row,
             textvariable=self.protocol_var,
             state="readonly",
             values=(FRAMED_PROTOCOL, RAW_PROTOCOL),
-            width=24,
+            width=22,
             style="Input.TCombobox",
         )
-        self.protocol_box.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=(10, 2))
-        ttk.Label(connection, text="图像颜色格式").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(10, 2))
+        self.protocol_box.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=2)
+        ttk.Label(format_row, text="图像颜色格式").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
         self.pixel_layout_box = ttk.Combobox(
-            connection,
+            format_row,
             textvariable=self.pixel_layout_var,
             state="readonly",
             values=list(PIXEL_LAYOUTS),
-            width=30,
+            width=28,
             style="Input.TCombobox",
         )
-        self.pixel_layout_box.grid(row=1, column=3, sticky="ew", padx=(0, 14), pady=(10, 2))
-        self.save_current_button = ttk.Button(connection, text="保存当前帧", command=self.save_current_frame)
-        self.save_current_button.grid(row=1, column=4, sticky="ew", padx=(0, 8), pady=(10, 2))
-        self.record_button = ttk.Button(connection, text="开始保存全部帧", command=self.toggle_frame_recording)
-        self.record_button.grid(row=1, column=5, sticky="ew", padx=(0, 8), pady=(10, 2))
-        self.connect_button = ttk.Button(connection, text="开始接收", style="Accent.TButton", command=self.toggle_connection)
-        self.connect_button.grid(row=1, column=6, sticky="e", pady=(10, 2))
-        ttk.Label(connection, textvariable=self.storage_info_var, foreground="#94a3b8").grid(
-            row=2, column=0, columnspan=6, sticky="w", pady=(8, 0)
+        self.pixel_layout_box.grid(row=0, column=3, sticky="ew", padx=(0, 12), pady=2)
+        self.save_current_button = ttk.Button(format_row, text="保存当前帧", command=self.save_current_frame)
+        self.save_current_button.grid(row=0, column=4, sticky="ew", padx=(0, 8), pady=2)
+        self.record_button = ttk.Button(format_row, text="开始保存全部帧", command=self.toggle_frame_recording)
+        self.record_button.grid(row=0, column=5, sticky="ew", pady=2)
+
+        utility_row = ttk.Frame(connection, style="Card.TFrame")
+        utility_row.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        utility_row.columnconfigure(0, weight=1)
+        self.storage_info_label = ttk.Label(utility_row, textvariable=self.storage_info_var, foreground=ui.MUTED)
+        self.storage_info_label.grid(
+            row=0, column=0, sticky="w", padx=(2, 8)
         )
-        ttk.Button(connection, text="清空日志", command=self.clear_logs).grid(
-            row=2, column=6, sticky="e", pady=(8, 0)
+        utility_row.bind("<Configure>", lambda event: self.storage_info_label.configure(wraplength=max(250, event.width - 112)))
+        ttk.Button(utility_row, text="清空日志", command=self.clear_logs).grid(
+            row=0, column=1, sticky="e"
         )
 
         main = ttk.PanedWindow(self.root, orient="horizontal")
-        main.grid(row=2, column=0, sticky="nsew", padx=14, pady=(10, 8))
+        main.grid(row=2, column=0, sticky="nsew", padx=14, pady=(8, 6))
 
-        image_card = ttk.LabelFrame(main, text=" 实时图像 ", padding=(10, 10))
+        image_card = ttk.LabelFrame(main, text=" 实时图像 ", padding=(10, 8))
         image_card.columnconfigure(0, weight=1)
         image_card.rowconfigure(1, weight=1)
         image_header = ttk.Frame(image_card, style="Card.TFrame")
-        image_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        image_header.grid(row=0, column=0, sticky="ew", pady=(0, 7))
         image_header.columnconfigure(0, weight=1)
-        ttk.Label(image_header, textvariable=self.image_info_var, foreground="#93c5fd").grid(row=0, column=0, sticky="w")
-        ttk.Button(image_header, text="导入处理配置", command=self.import_processing_config).grid(
-            row=0, column=1, padx=(6, 3)
+        self.image_info_label = ttk.Label(image_header, textvariable=self.image_info_var, foreground=ui.MUTED)
+        self.image_info_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 3))
+        image_header.bind("<Configure>", lambda event: self.image_info_label.configure(wraplength=max(230, event.width - 8)))
+        image_actions = ttk.Frame(image_header, style="Card.TFrame")
+        image_actions.grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Button(image_actions, text="导入处理配置", style="Compact.TButton", command=self.import_processing_config).grid(
+            row=0, column=0, padx=(0, 6)
         )
-        ttk.Button(image_header, text="导出配置（JSON + C）", command=self.export_processing_config).grid(
-            row=0, column=2, padx=(3, 0)
+        ttk.Button(image_actions, text="导出配置（JSON + C）", style="Compact.TButton", command=self.export_processing_config).grid(
+            row=0, column=1
         )
         self.image_notebook = ttk.Notebook(image_card)
         self.image_notebook.grid(row=1, column=0, sticky="nsew")
         live_tab = ttk.Frame(self.image_notebook, style="Card.TFrame")
         live_tab.columnconfigure(0, weight=1)
         live_tab.rowconfigure(0, weight=1)
-        self.canvas = tk.Canvas(live_tab, background="#06101f", highlightthickness=0)
+        self.canvas = tk.Canvas(live_tab, background=ui.PLOT, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.image_notebook.add(live_tab, text="实时图像")
@@ -341,7 +396,7 @@ class ImageTransmissionApp:
         self.image_notebook.bind("<<NotebookTabChanged>>", self._on_image_tab_changed)
         main.add(image_card, weight=3)
 
-        log_card = ttk.LabelFrame(main, text=" 分级调试信息 ", padding=(2, 2))
+        log_card = ttk.LabelFrame(main, text=" 分级调试信息 ", padding=(7, 7))
         log_card.columnconfigure(0, weight=1)
         log_card.rowconfigure(0, weight=1)
         self.debug_notebook = ttk.Notebook(log_card)
@@ -353,9 +408,9 @@ class ImageTransmissionApp:
         log_split = ttk.PanedWindow(log_tab, orient="vertical")
         log_split.grid(row=0, column=0, sticky="nsew")
         self.log_panes = {
-            "info": LogPane(log_split, "INFO", "#5eead4"),
-            "warning": LogPane(log_split, "WARNING", "#fbbf24"),
-            "error": LogPane(log_split, "ERROR", "#fb7185"),
+            "info": LogPane(log_split, "INFO", ui.SUCCESS),
+            "warning": LogPane(log_split, "WARNING", ui.WARNING),
+            "error": LogPane(log_split, "ERROR", ui.ERROR),
         }
         for level in ("info", "warning", "error"):
             log_split.add(self.log_panes[level], weight=1)
@@ -365,9 +420,11 @@ class ImageTransmissionApp:
         self.debug_notebook.bind("<<NotebookTabChanged>>", self._on_debug_tab_changed)
         main.add(log_card, weight=2)
 
-        footer = ttk.Frame(self.root, style="Card.TFrame", padding=(14, 8))
-        footer.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 14))
-        ttk.Label(footer, textvariable=self.stats_var, style="Section.TLabel", foreground="#94a3b8").grid(row=0, column=0, sticky="w")
+        footer = ttk.Frame(self.root, style="Footer.TFrame", padding=(3, 5))
+        footer.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 7))
+        self.stats_label = ttk.Label(footer, textvariable=self.stats_var, style="Footer.TLabel")
+        self.stats_label.grid(row=0, column=0, sticky="w")
+        footer.bind("<Configure>", lambda event: self.stats_label.configure(wraplength=max(400, event.width - 8)))
 
     def _on_transport_change(self) -> None:
         mode = TRANSPORTS[self.transport_var.get()]
