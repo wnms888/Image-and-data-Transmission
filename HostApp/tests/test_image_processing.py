@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -69,6 +70,17 @@ class ImageProcessingTests(unittest.TestCase):
             loaded_ipm, loaded_colour = load_processing_config(path)
         self.assertEqual(loaded_ipm, ipm)
         self.assertEqual(loaded_colour, colour)
+
+    def test_failed_atomic_replace_keeps_last_saved_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / 'last.json'
+            save_processing_config(path, IpmConfig(near_x=.3), ColourDetectionConfig())
+            previous = path.read_bytes()
+            with patch('image_processing.os.replace', side_effect=OSError('disk unavailable')):
+                with self.assertRaises(OSError):
+                    save_processing_config(path, IpmConfig(near_x=.4), ColourDetectionConfig())
+            self.assertEqual(path.read_bytes(), previous)
+            self.assertEqual(list(path.parent.glob('*.tmp')), [])
 
     def test_embedded_c_export_contains_the_host_tuning(self):
         ipm = IpmConfig(near_x=0.35, far_x=2.75, half_width_y=0.9, output_width=200)

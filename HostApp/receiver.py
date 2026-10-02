@@ -92,6 +92,7 @@ class InputWorker(threading.Thread):
             if not self._stop_event.is_set():
                 self.events.put(("error", str(exc)))
         finally:
+            self.request_stop()
             self.events.put(("stopped", "输入已停止"))
 
     def _run_tcp_listener(self) -> None:

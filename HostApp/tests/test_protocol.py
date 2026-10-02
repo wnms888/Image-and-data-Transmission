@@ -1,5 +1,6 @@
 import pathlib
 import sys
+import struct
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -9,6 +10,9 @@ from protocol import (
     PACKET_TEXT,
     PIXEL_FLAG_RGB565_MSB_FIRST,
     PIXEL_LAYOUT_RGB565_MSB,
+    PIXEL_LAYOUT_RGB565_LSB,
+    PIXEL_LAYOUT_BGR565_MSB,
+    PIXEL_LAYOUT_BGR565_LSB,
     RawPrintfParser,
     StreamParser,
     encode_packet,
@@ -122,6 +126,22 @@ class PrintfParserTests(unittest.TestCase):
                     offset = ((y * height // target_height) * width + x * width // target_width) * 3
                     expected.extend(source[offset:offset + 3])
             self.assertEqual(resize_rgb888_nearest(source, width, height, target_width, target_height), bytes(expected))
+
+    def test_lookup_decoder_matches_all_16_bit_colours_in_every_layout(self):
+        reference = bytearray()
+        reversed_reference = bytearray()
+        for word in range(65536):
+            r, g, b = word >> 11, (word >> 5) & 63, word & 31
+            colour = bytes(((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)))
+            reference.extend(colour)
+            reversed_reference.extend(colour[::-1])
+        for byte_order, layout, bgr_layout in (
+            ('>', PIXEL_LAYOUT_RGB565_MSB, PIXEL_LAYOUT_BGR565_MSB),
+            ('<', PIXEL_LAYOUT_RGB565_LSB, PIXEL_LAYOUT_BGR565_LSB),
+        ):
+            payload = struct.pack(byte_order + '65536H', *range(65536))
+            self.assertEqual(rgb565_to_rgb888(payload, 256, 256, layout=layout), bytes(reference))
+            self.assertEqual(rgb565_to_rgb888(payload, 256, 256, layout=bgr_layout), bytes(reversed_reference))
 
 
 if __name__ == "__main__":

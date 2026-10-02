@@ -6,6 +6,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 import queue
+import threading
 import tkinter as tk
 from time import perf_counter
 from tkinter import filedialog, messagebox, ttk
@@ -110,8 +111,13 @@ class LogPane(ttk.Frame):
 
 
 class ImageTransmissionApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, processing_state_path: Path | None = None) -> None:
         self.root = root
+        self.processing_state_path = (Path(processing_state_path) if processing_state_path is not None
+                                      else Path(__file__).resolve().parent / "last_processing_config.json")
+        self._closing = False
+        self._shutdown_complete = threading.Event()
+        self._shutdown_error = ""
         self.root.title("IMGT 图像与调试监视器")
         self.root.minsize(960, 640)
         self.root.geometry("1280x800")
@@ -134,6 +140,7 @@ class ImageTransmissionApp:
         self._last_preview_render_at = 0.0
         self._preview_frame_interval = 1.0 / 30.0
         self._last_stats_update_at = 0.0
+        self._last_log_flush_at = 0.0
         self._resize_render_pending = False
         self._preview_dirty = False
         self._processing_refresh_pending = False
@@ -161,6 +168,7 @@ class ImageTransmissionApp:
         self.storage_info_var = tk.StringVar(value="图像默认保存为 PNG 到 captured_frames 文件夹")
 
         self._build_layout()
+        self._restore_processing_state()
         self.pixel_layout_var.trace_add("write", self._on_pixel_layout_change)
         self._on_transport_change()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -356,10 +364,12 @@ class ImageTransmissionApp:
         self.storage_info_label.grid(
             row=0, column=0, sticky="w", padx=(2, 8)
         )
-        utility_row.bind("<Configure>", lambda event: self.storage_info_label.configure(wraplength=max(250, event.width - 112)))
+        utility_row.bind("<Configure>", lambda event: self.storage_info_label.configure(wraplength=max(200, event.width - 205)))
         ttk.Button(utility_row, text="清空日志", command=self.clear_logs).grid(
-            row=0, column=1, sticky="e"
+            row=0, column=1, sticky="e", padx=(0, 8)
         )
+        self.exit_button = ttk.Button(utility_row, text="退出", command=self.close)
+        self.exit_button.grid(row=0, column=2, sticky="e")
 
         main = ttk.PanedWindow(self.root, orient="horizontal")
         main.grid(row=2, column=0, sticky="nsew", padx=14, pady=(8, 6))
@@ -502,6 +512,8 @@ class ImageTransmissionApp:
         self._set_status("已停止", connected=False)
 
     def _drain_events(self) -> None:
+        if self._closing:
+            return
         # Do not let a continuous TCP sender monopolise Tk's event loop.  A
         # short budget preserves input throughput while leaving time to paint,
         # resize, hover the scope, and handle button clicks.
@@ -529,7 +541,9 @@ class ImageTransmissionApp:
             self._preview_dirty = False
             self._last_preview_render_at = now
             self._render_current_image()
-        self._flush_log_batches()
+        if now - self._last_log_flush_at >= 0.08:
+            self._last_log_flush_at = now
+            self._flush_log_batches()
         if now - self._last_stats_update_at >= 0.25:
             self._last_stats_update_at = now
             self._update_stats()
@@ -601,6 +615,8 @@ class ImageTransmissionApp:
             self._render_current_image()
 
     def _render_current_image(self) -> None:
+        if self._closing:
+            return
         packet = self.last_image_packet
         if packet is None:
             return
@@ -701,7 +717,7 @@ class ImageTransmissionApp:
     def _request_processing_refresh(self) -> None:
         """Debounce slider/spinbox changes before running a PC-side preview."""
 
-        if self._processing_refresh_pending:
+        if self._closing or self._processing_refresh_pending:
             return
         self._processing_refresh_pending = True
         self.root.after(60, self._render_requested_processing_tab)
@@ -748,7 +764,7 @@ class ImageTransmissionApp:
             )
             save_embedded_processing_config(copy_header_path, ipm_config, colour_config)
             save_embedded_processing_config(embedded_header_path, ipm_config, colour_config)
-        except (OSError, ValueError, ProcessingConfigError) as error:
+        except (OSError, ValueError, tk.TclError) as error:
             messagebox.showerror("导出失败", str(error), parent=self.root)
             return
         self.storage_info_var.set(
@@ -774,11 +790,28 @@ class ImageTransmissionApp:
         self.storage_info_var.set(f"已导入图像处理配置：{Path(path).name}")
         self._request_processing_refresh()
 
+    def _restore_processing_state(self) -> None:
+        """Restore the last session, or an existing export on the first launch."""
+        source = self.processing_state_path
+        if not source.exists():
+            source = Path(__file__).resolve().parent / "imgt_processing_config.json"
+        if not source.exists():
+            return
+        try:
+            ipm, colour = load_processing_config(source)
+            self.ipm_pane.apply_config(ipm)
+            self.colour_pane.apply_config(colour)
+        except (OSError, ValueError, tk.TclError) as error:
+            self.storage_info_var.set(f"自动恢复配置失败：{source.name}；当前使用默认参数")
+            self._append_system_error(f"自动恢复处理参数失败：{source}：{error}")
+            return
+        self.storage_info_var.set(f"已自动恢复处理参数：{source.name}")
+
     def _append_system_error(self, text: str) -> None:
         from protocol import DebugMessage
         from datetime import datetime
 
-        self._show_message(DebugMessage("error", "接收器", (), "", datetime.now(), text))
+        self._show_message(DebugMessage("error", f"接收器：{text}", (), "", datetime.now(), text))
 
     def _set_status(self, text: str, connected: bool) -> None:
         self.status_var.set(text)
@@ -801,9 +834,57 @@ class ImageTransmissionApp:
             lines.clear()
 
     def close(self) -> None:
-        self.disconnect()
-        self.frame_saver.close()
-        self.root.destroy()
+        if self._closing:
+            return
+        try:
+            # Read entry variables directly, including edits that still have
+            # keyboard focus. Invalid edits or a disk error keep the app open.
+            save_processing_config(self.processing_state_path,
+                                   self.ipm_pane.get_config(), self.colour_pane.get_config())
+        except (OSError, ValueError, tk.TclError) as error:
+            messagebox.showerror("无法保存处理参数", f"参数未保存，软件保持打开。请修正参数或保存路径后再次退出。\n\n{error}",
+                                 parent=self.root)
+            return
+        self._closing = True
+        self.root.title("IMGT 图像与调试监视器 · 正在退出")
+        self.storage_info_var.set("处理参数已保存，正在完成后台图片保存任务…")
+        # Prevent edits after the snapshot was saved while the writer drains.
+        def disable_widgets(widget: tk.Misc) -> None:
+            if isinstance(widget, ttk.Widget):
+                widget.state(["disabled"])
+            for child in widget.winfo_children():
+                disable_widgets(child)
+        disable_widgets(self.root)
+        self.ipm_pane.shutdown_processing()
+        self.colour_pane.shutdown_processing()
+        if self.worker is not None:
+            self.worker.request_stop()
+        self.frame_saver.stop_recording()
+        threading.Thread(target=self._finish_shutdown, name="monitor-shutdown", daemon=False).start()
+        self.root.after(30, self._poll_shutdown)
+
+    def _finish_shutdown(self) -> None:
+        """Joining I/O threads must never freeze Tk during exit."""
+        try:
+            if self.worker is not None:
+                self.worker.join()
+            self.frame_saver.close()
+        except Exception as error:
+            self._shutdown_error = str(error)
+        finally:
+            self._shutdown_complete.set()
+
+    def _poll_shutdown(self) -> None:
+        if self._shutdown_complete.is_set():
+            if self._shutdown_error:
+                messagebox.showerror("结束后台任务失败", f"处理参数已保存。\n{self._shutdown_error}", parent=self.root)
+            for callback in self.root.tk.call("after", "info"):
+                self.root.after_cancel(callback)
+            self.root.destroy()
+            return
+        saved = self.frame_saver.stats()[0]
+        self.storage_info_var.set(f"处理参数已保存 · 已保存 {saved} 帧 · 等待后台任务结束…")
+        self.root.after(50, self._poll_shutdown)
 
 
 def main() -> None:

@@ -110,11 +110,12 @@ class FrameSaveWorker:
         with self._lock:
             return self.saved_count, self.dropped_count, self.error_count, self.last_error
 
-    def close(self) -> None:
+    def close(self, timeout: float | None = None) -> None:
+        """Drain accepted jobs before returning; the GUI calls this off-thread."""
         self.stop_recording()
         try:
             self._jobs.put_nowait(None)
         except queue.Full:
             # Let the worker drain the outstanding image jobs before shutdown.
             self._jobs.put(None)
-        self._thread.join(timeout=3.0)
+        self._thread.join(timeout=timeout)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 import math
 import re
 import struct
@@ -365,6 +366,17 @@ def resolve_pixel_layout(layout: str, packet_flags: int = 0) -> str:
     raise ValueError(f"unknown RGB565 layout: {layout}")
 
 
+@lru_cache(maxsize=2)
+def _rgb565_palette(bgr: bool) -> tuple[bytes, ...]:
+    """One immutable RGB888 entry per 16-bit word, shared by preview and PNG writing."""
+    colours = []
+    for value in range(65536):
+        red, green, blue = (value >> 11) & 31, (value >> 5) & 63, value & 31
+        red, green, blue = (red << 3) | (red >> 2), (green << 2) | (green >> 4), (blue << 3) | (blue >> 2)
+        colours.append(bytes((blue, green, red) if bgr else (red, green, blue)))
+    return tuple(colours)
+
+
 def rgb565_to_rgb888(
     payload: bytes,
     width: int,
@@ -382,25 +394,10 @@ def rgb565_to_rgb888(
     layout = resolve_pixel_layout(layout, packet_flags)
     msb_first = layout in (PIXEL_LAYOUT_RGB565_MSB, PIXEL_LAYOUT_BGR565_MSB)
     bgr = layout in (PIXEL_LAYOUT_BGR565_MSB, PIXEL_LAYOUT_BGR565_LSB)
-    rgb = bytearray(width * height * 3)
-    source = memoryview(payload)
-    destination = 0
-    for offset in range(0, len(payload), 2):
-        value = (
-            (source[offset] << 8) | source[offset + 1]
-            if msb_first
-            else source[offset] | (source[offset + 1] << 8)
-        )
-        red = (value >> 11) & 0x1F
-        green = (value >> 5) & 0x3F
-        blue = value & 0x1F
-        if bgr:
-            red, blue = blue, red
-        rgb[destination] = (red << 3) | (red >> 2)
-        rgb[destination + 1] = (green << 2) | (green >> 4)
-        rgb[destination + 2] = (blue << 3) | (blue >> 2)
-        destination += 3
-    return bytes(rgb)
+    palette = _rgb565_palette(bgr)
+    return b"".join(palette[value[0]] for value in struct.iter_unpack(
+        ">H" if msb_first else "<H", payload
+    ))
 
 
 def rgb565_to_ppm(

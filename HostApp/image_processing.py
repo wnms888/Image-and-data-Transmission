@@ -13,7 +13,9 @@ from dataclasses import asdict, dataclass
 import colorsys
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -121,13 +123,10 @@ class IpmProcessor:
         if len(rgb) != source_width * source_height * 3:
             raise ValueError("source RGB888 dimensions do not match data length")
         self._ensure_lookup(source_width, source_height, config)
-        output = bytearray(config.output_width * config.output_height * 3)
-        destination = 0
-        for source in self._lookup:
-            if source >= 0:
-                output[destination : destination + 3] = rgb[source : source + 3]
-            destination += 3
-        return bytes(output)
+        return b"".join(
+            rgb[source:source + 3] if source >= 0 else b"\x00\x00\x00"
+            for source in self._lookup
+        )
 
     def _ensure_lookup(self, source_width: int, source_height: int, config: IpmConfig) -> None:
         key = (source_width, source_height, config)
@@ -403,7 +402,21 @@ def save_processing_config(path: str | Path, ipm: IpmConfig, colour: ColourDetec
         "ipm": asdict(ipm),
         "colour_detection": asdict(colour),
     }
-    Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Replace only after a complete write in the same directory. A write or
+    # replace failure must leave the last successfully saved configuration intact.
+    target = Path(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent,
+                                         prefix=f".{target.name}.", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def _c_float(value: float) -> str:
@@ -633,7 +646,9 @@ def _validate_colour_config(config: ColourDetectionConfig) -> None:
                 threshold.h_min, threshold.h_max, threshold.s_min, threshold.s_max,
                 threshold.l_min, threshold.l_max,
             ))
+            or threshold.s_min > threshold.s_max or threshold.l_min > threshold.l_max
             or threshold.area_min <= 0 or threshold.area_max < threshold.area_min
+            or threshold.width_min <= 0 or threshold.height_min <= 0
             or threshold.area_max > 65535 or threshold.width_min > 65535
             or threshold.height_min > 65535 or threshold.fill_min_permille < 0
             or threshold.fill_min_permille > 65535
@@ -888,6 +903,12 @@ class _DualImagePane(ttk.Frame):
 
     def _on_processing_destroy(self, event: tk.Event) -> None:
         if event.widget is not self:
+            return
+        self.shutdown_processing()
+
+    def shutdown_processing(self) -> None:
+        """Stop scheduling work; safe to call before or during widget destruction."""
+        if self._processing_closed:
             return
         self._processing_closed = True
         if self._processing_poll is not None:
@@ -1292,16 +1313,10 @@ class ColourDetectionPane(_DualImagePane):
 
     @staticmethod
     def _threshold(values: tuple[tk.IntVar, ...], geometry: dict[str, tk.IntVar]) -> HslThreshold:
-        hsl = [max(0, min(240, int(value.get()))) for value in values]
+        hsl = [int(value.get()) for value in values]
         return HslThreshold(
             *hsl,
-            area_min=max(1, int(geometry["area_min"].get())),
-            area_max=max(1, int(geometry["area_max"].get())),
-            width_min=max(1, int(geometry["width_min"].get())),
-            height_min=max(1, int(geometry["height_min"].get())),
-            fill_min_permille=max(0, int(geometry["fill_min_permille"].get())),
-            aspect_min_permille=max(0, int(geometry["aspect_min_permille"].get())),
-            aspect_max_permille=max(0, int(geometry["aspect_max_permille"].get())),
+            **{key: int(variable.get()) for key, variable in geometry.items()},
         )
 
     def get_config(self) -> ColourDetectionConfig:
@@ -1318,10 +1333,10 @@ class ColourDetectionPane(_DualImagePane):
                                            self._threshold(row["hsl"], row["geometry"]), rgb))
         return ColourDetectionConfig(
             colours=tuple(colours),
-            roi_top_percent=max(0, min(100, int(self.roi_top_var.get()))),
-            roi_left_percent=max(0, min(100, int(self.roi_left_var.get()))),
-            roi_right_percent=max(0, min(100, int(self.roi_right_var.get()))),
-            maximum_components=max(1, int(self.maximum_components_var.get())),
+            roi_top_percent=int(self.roi_top_var.get()),
+            roi_left_percent=int(self.roi_left_var.get()),
+            roi_right_percent=int(self.roi_right_var.get()),
+            maximum_components=int(self.maximum_components_var.get()),
         )
 
     def apply_config(self, config: ColourDetectionConfig) -> None:
