@@ -448,27 +448,28 @@ def resize_rgb888_nearest(
     if (source_width, source_height) == (target_width, target_height):
         return rgb
 
-    source = memoryview(rgb)
-    row_width = target_width * 3
-    output = bytearray(row_width * target_height)
-    x_offsets = [(x * source_width // target_width) * 3 for x in range(target_width)]
-    destination_offset = 0
+    # Group repeated source pixels when enlarging. Building one bytes row
+    # avoids a Python slice assignment for every displayed pixel.
+    x_runs: list[tuple[int, int]] = []
+    for x in range(target_width):
+        offset = (x * source_width // target_width) * 3
+        if x_runs and x_runs[-1][0] == offset:
+            x_runs[-1] = (offset, x_runs[-1][1] + 1)
+        else:
+            x_runs.append((offset, 1))
+    rows: list[bytes] = []
     cached_source_row = -1
     cached_scaled_row = b""
     for y in range(target_height):
         source_row = y * source_height // target_height
         if source_row != cached_source_row:
             base = source_row * source_width * 3
-            row = bytearray(row_width)
-            for x, source_offset in enumerate(x_offsets):
-                target_offset = x * 3
-                pixel_offset = base + source_offset
-                row[target_offset : target_offset + 3] = source[pixel_offset : pixel_offset + 3]
-            cached_scaled_row = bytes(row)
+            cached_scaled_row = b"".join(
+                rgb[base + offset:base + offset + 3] * repeat for offset, repeat in x_runs
+            )
             cached_source_row = source_row
-        output[destination_offset : destination_offset + row_width] = cached_scaled_row
-        destination_offset += row_width
-    return bytes(output)
+        rows.append(cached_scaled_row)
+    return b"".join(rows)
 
 
 def rgb888_to_png(rgb: bytes, width: int, height: int) -> bytes:

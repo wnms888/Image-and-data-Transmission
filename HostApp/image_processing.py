@@ -8,6 +8,7 @@ the received RGB565 frame or the image-saving path.
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import colorsys
 import json
@@ -249,14 +250,32 @@ def rgb_to_hsl240(red: int, green: int, blue: int) -> tuple[int, int, int]:
     return max(0, min(240, hue)), max(0, min(240, saturation)), max(0, min(240, lightness))
 
 
+class ColourDetector:
+    """Bounded RGB classification cache shared by consecutive camera frames."""
+
+    def __init__(self) -> None:
+        self._hsl_key: tuple = ()
+        self._labels_by_rgb: dict[int, int] = {}
+
+    def process(self, rgb: bytes, width: int, height: int, config: ColourDetectionConfig) -> ColourDetectionOutput:
+        key = tuple((t.h_min, t.h_max, t.s_min, t.s_max, t.l_min, t.l_max)
+                    for t in (item.threshold for item in config.colours))
+        if key != self._hsl_key:
+            self._hsl_key = key
+            self._labels_by_rgb.clear()
+        return detect_colours(rgb, width, height, config, _label_cache=self._labels_by_rgb)
+
+
 def detect_colours(
-    rgb: bytes, width: int, height: int, config: ColourDetectionConfig
+    rgb: bytes, width: int, height: int, config: ColourDetectionConfig,
+    *, _label_cache: dict[int, int] | None = None,
 ) -> ColourDetectionOutput:
     """Apply ordered HSL rules and four-connected area filters."""
 
     if len(rgb) != width * height * 3:
         raise ValueError("source RGB888 dimensions do not match data length")
     _validate_colour_config(config)
+    cache = _label_cache if _label_cache is not None else {}
     labels = [0] * (width * height)
     start_row = min(height, max(0, round(height * config.roi_top_percent / 100)))
     start_column = min(width, max(0, round(width * config.roi_left_percent / 100)))
@@ -265,12 +284,21 @@ def detect_colours(
         for x in range(start_column, end_column):
             index = (y * width + x) * 3
             red, green, blue = rgb[index], rgb[index + 1], rgb[index + 2]
-            hue, saturation, lightness = rgb_to_hsl240(red, green, blue)
             label_index = y * width + x
-            for colour_index, colour in enumerate(config.colours, 1):
-                if colour.threshold.matches(hue, saturation, lightness):
-                    labels[label_index] = colour_index
-                    break
+            rgb_key = (red << 16) | (green << 8) | blue
+            label = cache.get(rgb_key)
+            if label is None:
+                hue, saturation, lightness = rgb_to_hsl240(red, green, blue)
+                label = 0
+                for colour_index, colour in enumerate(config.colours, 1):
+                    if colour.threshold.matches(hue, saturation, lightness):
+                        label = colour_index
+                        break
+                # RGB565 has at most 65,536 distinct expanded RGB colours.
+                # Also bound memory when an RGB888 source is used in tests.
+                if len(cache) < 65536:
+                    cache[rgb_key] = label
+            labels[label_index] = label
 
     output = bytearray(width * height * 3)
     counts = [0] * len(config.colours)
@@ -285,9 +313,10 @@ def detect_colours(
         if counts[label - 1] >= config.maximum_components:
             continue
         colour = colour_rule.preview_rgb
+        colour_bytes = bytes(colour)
         for pixel in component:
             destination = pixel * 3
-            output[destination : destination + 3] = bytes(colour)
+            output[destination : destination + 3] = colour_bytes
         _draw_component_border(output, width, height, component, colour)
         counts[label - 1] += 1
     return ColourDetectionOutput(bytes(output), tuple(counts))
@@ -615,6 +644,18 @@ def _validate_colour_config(config: ColourDetectionConfig) -> None:
             raise ProcessingConfigError("颜色阈值范围无效")
 
 
+def preview_to_source_pixel(
+    x: int, y: int, rectangle: tuple[int, int, int, int], width: int, height: int,
+) -> tuple[int, int] | None:
+    """Map a fitted preview pixel back to the exact nearest-neighbour source."""
+    left, top, displayed_width, displayed_height = rectangle
+    if min(width, height, displayed_width, displayed_height) <= 0:
+        return None
+    if not (left <= x < left + displayed_width and top <= y < top + displayed_height):
+        return None
+    return ((x - left) * width // displayed_width, (y - top) * height // displayed_height)
+
+
 class _ImagePreview(ttk.Frame):
     """A canvas that keeps an RGB888 frame fitted to its own size."""
 
@@ -627,12 +668,87 @@ class _ImagePreview(ttk.Frame):
         )
         self.canvas = tk.Canvas(self, background=ui.PLOT, highlightthickness=0)
         self.canvas.grid(row=1, column=0, sticky="nsew")
-        self.canvas.bind("<Configure>", lambda _event: self._render())
+        self.canvas.bind("<Configure>", self._schedule_resize)
         self._rgb = b""
         self._width = 0
         self._height = 0
         self._photo: tk.PhotoImage | None = None
         self._item: int | None = None
+        self._rendered_rgb: bytes | None = None
+        self._rendered_size: tuple[int, int, int, int] | None = None
+        self._display_rectangle = (0, 0, 0, 0)
+        self._resize_after: str | None = None
+        self._probe_enabled = False
+        self._probe_position: tuple[int, int] | None = None
+        self._probe_text: int | None = None
+        self._probe_background: int | None = None
+        self.pixel_info_var = tk.StringVar(value="悬停原图像素查看 HSL（0–240）")
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def enable_hsl_probe(self) -> None:
+        self._probe_enabled = True
+        ttk.Label(self, textvariable=self.pixel_info_var, style="Section.TLabel").grid(
+            row=2, column=0, sticky="ew", pady=(4, 0)
+        )
+        self.canvas.bind("<Motion>", self._on_probe_motion)
+        self.canvas.bind("<Leave>", self._on_probe_leave)
+
+    def _schedule_resize(self, _event: tk.Event) -> None:
+        if self._resize_after is None:
+            self._resize_after = self.after(50, self._render_after_resize)
+
+    def _render_after_resize(self) -> None:
+        self._resize_after = None
+        self._render()
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is self and self._resize_after is not None:
+            self.after_cancel(self._resize_after)
+            self._resize_after = None
+
+    def _on_probe_motion(self, event: tk.Event) -> None:
+        self._probe_position = (event.x, event.y)
+        self._update_probe()
+
+    def _on_probe_leave(self, _event: tk.Event) -> None:
+        self._probe_position = None
+        self._update_probe()
+
+    def _update_probe(self) -> None:
+        if not self._probe_enabled:
+            return
+        source = None
+        if self._probe_position is not None and self._rgb:
+            source = preview_to_source_pixel(*self._probe_position, self._display_rectangle,
+                                             self._width, self._height)
+        if source is None:
+            self.pixel_info_var.set("悬停原图像素查看 HSL（0–240）")
+            self.canvas.itemconfigure("pixel_probe", state="hidden")
+            return
+        x, y = source
+        offset = (y * self._width + x) * 3
+        h, s, l = rgb_to_hsl240(*self._rgb[offset:offset + 3])
+        self.pixel_info_var.set(f"X {x}  Y {y}  ·  H {h}  S {s}  L {l}")
+        text = f"({x}, {y})\nH {h}   S {s}   L {l}"
+        if self._probe_text is None:
+            self._probe_background = self.canvas.create_rectangle(
+                0, 0, 1, 1, fill=ui.SURFACE_RAISED, outline=ui.HAIRLINE, tags="pixel_probe"
+            )
+            self._probe_text = self.canvas.create_text(
+                0, 0, anchor="nw", fill=ui.TEXT, font=("Microsoft YaHei UI", 9), tags="pixel_probe"
+            )
+        self.canvas.itemconfigure(self._probe_text, text=text)
+        self.canvas.itemconfigure("pixel_probe", state="normal")
+        self.canvas.coords(self._probe_text, 0, 0)
+        bbox = self.canvas.bbox(self._probe_text)
+        if bbox is not None:
+            box_width, box_height = bbox[2] - bbox[0] + 12, bbox[3] - bbox[1] + 10
+            pointer_x, pointer_y = self._probe_position
+            left = max(0, min(pointer_x + 14, self.canvas.winfo_width() - box_width))
+            top = max(0, min(pointer_y + 16, self.canvas.winfo_height() - box_height))
+            self.canvas.coords(self._probe_background, left, top, left + box_width, top + box_height)
+            self.canvas.coords(self._probe_text, left + 6, top + 5)
+        self.canvas.tag_raise("pixel_probe")
 
     def set_image(self, rgb: bytes, width: int, height: int) -> None:
         self._rgb, self._width, self._height = rgb, width, height
@@ -647,23 +763,26 @@ class _ImagePreview(ttk.Frame):
             max(1, self.canvas.winfo_width()),
             max(1, self.canvas.winfo_height()),
         )
-        display = resize_rgb888_nearest(
-            self._rgb, self._width, self._height, target_width, target_height
-        )
-        self._photo = tk.PhotoImage(
-            master=self.canvas,
-            data=rgb888_to_ppm(display, target_width, target_height),
-            format="PPM",
-        )
-        if self._item is None:
-            self._item = self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
-        else:
-            self.canvas.itemconfigure(self._item, image=self._photo)
-        self.canvas.coords(
-            self._item,
-            max(0, (self.canvas.winfo_width() - target_width) // 2),
-            max(0, (self.canvas.winfo_height() - target_height) // 2),
-        )
+        size = (self._width, self._height, target_width, target_height)
+        if self._rendered_rgb is not self._rgb or self._rendered_size != size:
+            display = resize_rgb888_nearest(
+                self._rgb, self._width, self._height, target_width, target_height
+            )
+            self._photo = tk.PhotoImage(
+                master=self.canvas,
+                data=rgb888_to_ppm(display, target_width, target_height), format="PPM",
+            )
+            if self._item is None:
+                self._item = self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
+            else:
+                self.canvas.itemconfigure(self._item, image=self._photo)
+            self._rendered_rgb, self._rendered_size = self._rgb, size
+        left = max(0, (self.canvas.winfo_width() - target_width) // 2)
+        top = max(0, (self.canvas.winfo_height() - target_height) // 2)
+        self.canvas.coords(self._item, left, top)
+        self._display_rectangle = (left, top, target_width, target_height)
+        # Refresh values for a stationary pointer when the camera frame changes.
+        self._update_probe()
 
 
 class _DualImagePane(ttk.Frame):
@@ -671,6 +790,15 @@ class _DualImagePane(ttk.Frame):
 
     def __init__(self, parent: tk.Misc, source_label: str, result_label: str) -> None:
         super().__init__(parent, style="Card.TFrame", padding=(8, 8))
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="image-processing")
+        self._processing_future: Future | None = None
+        self._processing_poll: str | None = None
+        self._pending_processing: tuple | None = None
+        self._running_processing: tuple | None = None
+        self._last_request: tuple | None = None
+        self._desired_config: object | None = None
+        self._processing_closed = False
+        self.bind("<Destroy>", self._on_processing_destroy, add="+")
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
         # At laptop height the colour controls are taller than the preview
@@ -703,6 +831,70 @@ class _DualImagePane(ttk.Frame):
         self.original_preview.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self.result_preview = _ImagePreview(previews, result_label)
         self.result_preview.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+    def _queue_processing(self, rgb: bytes, width: int, height: int, config: object) -> None:
+        if self._processing_closed:
+            return
+        previous = self._last_request
+        if previous is not None and previous[0] is rgb and previous[1:] == (width, height, config):
+            return
+        self._desired_config = config
+        self._last_request = (rgb, width, height, config)
+        # One running frame and one replaceable latest frame, never a backlog.
+        self._pending_processing = self._last_request
+        if self._processing_future is None:
+            self._start_processing()
+
+    def _start_processing(self) -> None:
+        self._running_processing = self._pending_processing
+        self._pending_processing = None
+        self._processing_future = self._executor.submit(self._process_frame, *self._running_processing)
+        self._processing_poll = self.after(15, self._poll_processing)
+
+    def _poll_processing(self) -> None:
+        self._processing_poll = None
+        if self._processing_closed or self._processing_future is None:
+            return
+        if not self._processing_future.done():
+            self._processing_poll = self.after(15, self._poll_processing)
+            return
+        job = self._running_processing
+        try:
+            result = self._processing_future.result()
+            if job[3] == self._desired_config:
+                # Tk objects are touched only here, on the main thread. Both
+                # previews always belong to the same completed source frame.
+                self._show_processing_result(*job, result)
+        except Exception as error:
+            if job[3] == self._desired_config:
+                self._show_processing_error(error)
+            self._last_request = None
+        self._processing_future = None
+        self._running_processing = None
+        if self._pending_processing is not None:
+            self._start_processing()
+
+    def _invalidate_processing(self, error: Exception) -> None:
+        self._desired_config = None
+        self._pending_processing = None
+        self._last_request = None
+        self._show_processing_error(error)
+
+    def _show_processing_error(self, error: Exception) -> None:
+        canvas = self.result_preview.canvas
+        canvas.delete("processing_error")
+        canvas.create_text(10, 10, anchor="nw", text=f"参数无效：{error}", fill=ui.ERROR,
+                           width=250, tags="processing_error")
+
+    def _on_processing_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        self._processing_closed = True
+        if self._processing_poll is not None:
+            self.after_cancel(self._processing_poll)
+            self._processing_poll = None
+        self._pending_processing = None
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _on_controls_resize(self, _event: tk.Event) -> None:
         self._control_canvas.configure(scrollregion=self._control_canvas.bbox("all"))
@@ -922,17 +1114,20 @@ class IpmPane(_DualImagePane):
 
     def update_frame(self, rgb: bytes, width: int, height: int) -> None:
         self._frame = (rgb, width, height)
-        self.original_preview.set_image(rgb, width, height)
         try:
             config = self.get_config()
             _validate_ipm_config(config)
-            result = self._processor.process(rgb, width, height, config)
-            self.result_preview.set_image(result, config.output_width, config.output_height)
+            self._queue_processing(rgb, width, height, config)
         except (tk.TclError, ValueError) as error:
-            self.result_preview.canvas.delete("all")
-            self.result_preview.canvas.create_text(
-                10, 10, anchor="nw", text=f"逆透视参数无效：{error}", fill=ui.ERROR
-            )
+            self._invalidate_processing(error)
+
+    def _process_frame(self, rgb: bytes, width: int, height: int, config: IpmConfig) -> bytes:
+        return self._processor.process(rgb, width, height, config)
+
+    def _show_processing_result(self, rgb: bytes, width: int, height: int, config: IpmConfig, result: bytes) -> None:
+        self.result_preview.canvas.delete("processing_error")
+        self.original_preview.set_image(rgb, width, height)
+        self.result_preview.set_image(result, config.output_width, config.output_height)
 
 
 class ColourDetectionPane(_DualImagePane):
@@ -940,6 +1135,8 @@ class ColourDetectionPane(_DualImagePane):
 
     def __init__(self, parent: tk.Misc, on_change: Callable[[], None]) -> None:
         super().__init__(parent, "实时原图", "颜色检测结果")
+        self.original_preview.enable_hsl_probe()
+        self._detector = ColourDetector()
         self._on_change = on_change
         self._frame: tuple[bytes, int, int] | None = None
         self.info_var = tk.StringVar(value="等待图像")
@@ -1214,14 +1411,24 @@ class ColourDetectionPane(_DualImagePane):
 
     def update_frame(self, rgb: bytes, width: int, height: int) -> None:
         self._frame = (rgb, width, height)
-        self.original_preview.set_image(rgb, width, height)
         try:
             config = self.get_config()
             _validate_colour_config(config)
-            result = detect_colours(rgb, width, height, config)
-            self.result_preview.set_image(result.image, width, height)
-            self.info_var.set(" · ".join(
-                f"{colour.name} {count} 个" for colour, count in zip(config.colours, result.component_counts)
-            ))
+            self._queue_processing(rgb, width, height, config)
         except (tk.TclError, ValueError) as error:
-            self.info_var.set(f"参数无效：{error}")
+            self._invalidate_processing(error)
+
+    def _process_frame(self, rgb: bytes, width: int, height: int, config: ColourDetectionConfig) -> ColourDetectionOutput:
+        return self._detector.process(rgb, width, height, config)
+
+    def _show_processing_result(
+        self, rgb: bytes, width: int, height: int, config: ColourDetectionConfig, result: ColourDetectionOutput,
+    ) -> None:
+        self.original_preview.set_image(rgb, width, height)
+        self.result_preview.set_image(result.image, width, height)
+        self.info_var.set(" · ".join(
+            f"{colour.name} {count} 个" for colour, count in zip(config.colours, result.component_counts)
+        ))
+
+    def _show_processing_error(self, error: Exception) -> None:
+        self.info_var.set(f"参数无效：{error}")

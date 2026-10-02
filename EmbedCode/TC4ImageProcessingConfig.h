@@ -50,15 +50,15 @@
 /* Host-configurable ordered detector settings. */
 #define TC4_CFG_COLOR_COUNT                       (4u)
 #define TC4_CFG_COLOR_MAX_CONES                   (12u)
-#define TC4_CFG_COLOR_ROI_TOP_PERCENT             (35u)
+#define TC4_CFG_COLOR_ROI_TOP_PERCENT             (0u)
 #define TC4_CFG_COLOR_ROI_LEFT_PERCENT            (0u)
 #define TC4_CFG_COLOR_ROI_RIGHT_PERCENT           (100u)
 
 /* H, S, L, area, width, height, fill and aspect for each rule. */
 #define TC4_CFG_COLOR_THRESHOLDS \
     {(0u), (45u), (120u), (240u), (80u), (160u), (50u), (12000u), (2u), (3u), (70u), (300u), (5000u)}, \
-    {(120u), (165u), (120u), (240u), (80u), (160u), (50u), (12000u), (2u), (3u), (70u), (300u), (5000u)}, \
-    {(165u), (190u), (120u), (240u), (40u), (160u), (50u), (12000u), (2u), (3u), (70u), (300u), (5000u)}, \
+    {(120u), (155u), (120u), (240u), (80u), (160u), (50u), (12000u), (2u), (3u), (70u), (300u), (5000u)}, \
+    {(155u), (190u), (60u), (240u), (40u), (160u), (50u), (12000u), (2u), (3u), (70u), (300u), (5000u)}, \
     {(0u), (240u), (0u), (50u), (0u), (50u), (10u), (12000u), (2u), (3u), (70u), (300u), (5000u)},
 
 /* Embedded-only safeguards, fixed in every host export. */

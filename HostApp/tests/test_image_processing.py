@@ -3,11 +3,13 @@ import re
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from image_processing import (
     ColourDetectionConfig,
+    ColourDetector,
     DetectionColour,
     HslThreshold,
     IpmConfig,
@@ -16,6 +18,7 @@ from image_processing import (
     load_processing_config,
     render_embedded_processing_config,
     rgb_to_hsl240,
+    preview_to_source_pixel,
     save_embedded_processing_config,
     save_processing_config,
 )
@@ -89,14 +92,44 @@ class ImageProcessingTests(unittest.TestCase):
             save_embedded_processing_config(path, ipm, colour)
             self.assertEqual(path.read_text(encoding='utf-8'), generated)
 
-    def test_repository_embedded_default_header_matches_host_defaults(self):
+    def test_repository_embedded_header_matches_saved_host_configuration(self):
         pattern = re.compile(r'^#define\s+(TC4_(?:IPM|CFG)_[A-Z0-9_]+)\s+(.+)$', re.MULTILINE)
+        root = pathlib.Path(__file__).resolve().parents[2]
+        saved = root / 'HostApp' / 'imgt_processing_config.json'
+        ipm, colour = load_processing_config(saved) if saved.exists() else (IpmConfig(), ColourDetectionConfig())
+        exported = render_embedded_processing_config(ipm, colour)
         generated = dict(pattern.findall(
-            render_embedded_processing_config(IpmConfig(), ColourDetectionConfig())
+            exported
         ))
-        embedded_header = pathlib.Path(__file__).resolve().parents[2] / 'EmbedCode' / 'TC4ImageProcessingConfig.h'
-        checked_in = dict(pattern.findall(embedded_header.read_text(encoding='utf-8')))
+        embedded_header = root / 'EmbedCode' / 'TC4ImageProcessingConfig.h'
+        header = embedded_header.read_text(encoding='utf-8')
+        checked_in = dict(pattern.findall(header))
         self.assertEqual(checked_in, generated)
+        table_pattern = r'#define TC4_CFG_COLOR_THRESHOLDS[^/]+?(?=/\* Embedded-only)'
+        self.assertEqual(re.search(table_pattern, header).group().strip(),
+                         re.search(table_pattern, exported).group().strip())
+
+    def test_hover_mapping_handles_letterbox_and_scaling(self):
+        rect = (10, 20, 8, 6)
+        self.assertEqual(preview_to_source_pixel(10, 20, rect, 4, 3), (0, 0))
+        self.assertEqual(preview_to_source_pixel(17, 25, rect, 4, 3), (3, 2))
+        for x, y in ((9, 20), (18, 20), (10, 19), (10, 26)):
+            self.assertIsNone(preview_to_source_pixel(x, y, rect, 4, 3))
+        self.assertEqual(preview_to_source_pixel(2, 1, (0, 0, 3, 2), 8, 6), (5, 3))
+        self.assertIsNone(preview_to_source_pixel(0, 0, (0, 0, 0, 0), 8, 6))
+
+    def test_colour_cache_invalidates_thresholds_and_applies_area_changes(self):
+        detector = ColourDetector()
+        rgb = bytes((255, 0, 0)) * 16
+        red = DetectionColour('红', HslThreshold(230, 15, 100, 240, 60, 240,
+                                               area_min=5, width_min=1, height_min=1), (255, 0, 0))
+        config = ColourDetectionConfig(colours=(red,), roi_top_percent=0)
+        self.assertEqual(detector.process(rgb, 4, 4, config).component_counts, (1,))
+        larger = replace(config, colours=(replace(red, threshold=replace(red.threshold, area_min=17)),))
+        self.assertEqual(detector.process(rgb, 4, 4, larger).component_counts, (0,))
+        blue = replace(config, colours=(replace(red, threshold=replace(red.threshold, h_min=150, h_max=170)),))
+        self.assertEqual(detector.process(rgb, 4, 4, blue).component_counts, (0,))
+        self.assertEqual(detector.process(bytes((0, 0, 255)) * 16, 4, 4, blue).component_counts, (1,))
 
     def test_arbitrary_colours_and_independent_minimum_areas(self):
         width, height = 8, 4

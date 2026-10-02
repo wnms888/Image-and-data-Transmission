@@ -127,15 +127,16 @@ class ImageTransmissionApp:
         self.image_item: int | None = None
         self.last_image_packet: Packet | None = None
         self._source_rgb = b""
-        self._source_rgb_key: tuple[int, str, int] | None = None
+        self._source_payload: bytes | None = None
+        self._source_rgb_key: tuple | None = None
+        self._live_render_rgb: bytes | None = None
+        self._live_render_size: tuple | None = None
+        self._last_preview_render_at = 0.0
+        self._preview_frame_interval = 1.0 / 30.0
+        self._last_stats_update_at = 0.0
         self._resize_render_pending = False
         self._preview_dirty = False
         self._processing_refresh_pending = False
-        # IPM and connected-component colour detection are intentionally
-        # CPU-side previews.  Keep their refresh rate bounded so the live
-        # camera and packet receiver stay responsive at high frame rates.
-        self._last_processing_render_at = 0.0
-        self._processing_frame_interval = 1.0 / 12.0
         self._pending_log_lines: dict[str, list[str]] = {
             "info": [], "warning": [], "error": []
         }
@@ -523,11 +524,15 @@ class ImageTransmissionApp:
                 self.worker = None
                 self.connect_button.configure(text="开始接收")
                 self._set_status(str(data), connected=False)
-        if self._preview_dirty:
+        now = perf_counter()
+        if self._preview_dirty and now - self._last_preview_render_at >= self._preview_frame_interval:
             self._preview_dirty = False
+            self._last_preview_render_at = now
             self._render_current_image()
         self._flush_log_batches()
-        self._update_stats()
+        if now - self._last_stats_update_at >= 0.25:
+            self._last_stats_update_at = now
+            self._update_stats()
         self.root.after(1 if not self.events.empty() else 30, self._drain_events)
 
     def _consume_bytes(self, data: bytes) -> None:
@@ -601,8 +606,8 @@ class ImageTransmissionApp:
             return
         try:
             layout = self._selected_pixel_layout()
-            source_key = (id(packet.payload), layout, packet.flags)
-            if self._source_rgb_key != source_key:
+            source_key = (packet.width, packet.height, layout, packet.flags)
+            if self._source_payload is not packet.payload or self._source_rgb_key != source_key:
                 self._source_rgb = rgb565_to_rgb888(
                     packet.payload,
                     packet.width,
@@ -611,28 +616,27 @@ class ImageTransmissionApp:
                     packet_flags=packet.flags,
                 )
                 self._source_rgb_key = source_key
-            target_width, target_height = fit_size(
-                packet.width,
-                packet.height,
-                max(1, self.canvas.winfo_width()),
-                max(1, self.canvas.winfo_height()),
-            )
-            display_rgb = resize_rgb888_nearest(
-                self._source_rgb,
-                packet.width,
-                packet.height,
-                target_width,
-                target_height,
-            )
-            self.photo = tk.PhotoImage(
-                data=rgb888_to_ppm(display_rgb, target_width, target_height),
-                format="PPM",
-            )
-            if self.image_item is None:
-                self.image_item = self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
-            else:
-                self.canvas.itemconfigure(self.image_item, image=self.photo)
-            self._center_image()
+                self._source_payload = packet.payload
+            # A hidden live-image tab needs neither scaling nor Tk uploads.
+            if self.image_notebook.select() == str(self.canvas.master):
+                target_width, target_height = fit_size(
+                    packet.width, packet.height,
+                    max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()),
+                )
+                size = (packet.width, packet.height, target_width, target_height)
+                if self._live_render_rgb is not self._source_rgb or self._live_render_size != size:
+                    display_rgb = resize_rgb888_nearest(
+                        self._source_rgb, packet.width, packet.height, target_width, target_height,
+                    )
+                    self.photo = tk.PhotoImage(
+                        data=rgb888_to_ppm(display_rgb, target_width, target_height), format="PPM",
+                    )
+                    if self.image_item is None:
+                        self.image_item = self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
+                    else:
+                        self.canvas.itemconfigure(self.image_item, image=self.photo)
+                    self._live_render_rgb, self._live_render_size = self._source_rgb, size
+                self._center_image()
             save_state = " · 正在录制" if self.frame_saver.is_recording else ""
             self.image_info_var.set(
                 f"RGB565 · {packet.width} × {packet.height} · {self.frame_rate:.1f} FPS · "
@@ -686,7 +690,7 @@ class ImageTransmissionApp:
         self._render_current_image()
 
     def _on_image_tab_changed(self, _event: tk.Event) -> None:
-        self._render_active_processing_tab(force=True)
+        self._render_current_image()
 
     def _on_debug_tab_changed(self, _event: tk.Event) -> None:
         """Redraw the scope only after its notebook page becomes visible."""
@@ -704,19 +708,17 @@ class ImageTransmissionApp:
 
     def _render_requested_processing_tab(self) -> None:
         self._processing_refresh_pending = False
-        self._render_active_processing_tab(force=True)
+        self._render_current_image()
 
-    def _render_active_processing_tab(self, force: bool = False) -> None:
+    def _render_active_processing_tab(self) -> None:
         packet = self.last_image_packet
         if packet is None or not self._source_rgb:
             return
         selected = self.image_notebook.select()
         if selected not in (str(self.ipm_pane), str(self.colour_pane)):
             return
-        now = perf_counter()
-        if not force and now - self._last_processing_render_at < self._processing_frame_interval:
-            return
-        self._last_processing_render_at = now
+        # The pane handles one running job plus the newest pending frame;
+        # every rendered camera update reaches it, including the final frame.
         if selected == str(self.ipm_pane):
             self.ipm_pane.update_frame(self._source_rgb, packet.width, packet.height)
         else:

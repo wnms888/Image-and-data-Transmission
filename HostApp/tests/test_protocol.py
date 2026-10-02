@@ -112,6 +112,17 @@ class PrintfParserTests(unittest.TestCase):
         self.assertEqual(scaled, expected_row * 2)
         self.assertTrue(rgb888_to_png(bytes((255, 0, 0)), 1, 1).startswith(b"\x89PNG\r\n\x1a\n"))
 
+    def test_nearest_scaling_matches_source_pixels_for_fractional_ratios(self):
+        width, height = 7, 5
+        source = bytes(range(width * height * 3))
+        for target_width, target_height in ((19, 12), (3, 2), (7, 5), (1, 1), (7, 13)):
+            expected = bytearray()
+            for y in range(target_height):
+                for x in range(target_width):
+                    offset = ((y * height // target_height) * width + x * width // target_width) * 3
+                    expected.extend(source[offset:offset + 3])
+            self.assertEqual(resize_rgb888_nearest(source, width, height, target_width, target_height), bytes(expected))
+
 
 if __name__ == "__main__":
     unittest.main()
