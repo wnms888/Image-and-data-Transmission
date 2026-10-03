@@ -317,8 +317,10 @@ void WifiImageTransfer_SubmitRgb565Frame(const uint16 *image, uint32 image_bytes
                                           SCC8660_W,
                                           SCC8660_H,
                                           WIFI_IMAGE_TRANSFER_RGB565_FORMAT,
-                                          (WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST != 0u) ?
-                                          WIFI_IMAGE_TRANSFER_FLAG_RGB565_MSB_FIRST : 0u);
+                                          ((WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST != 0u) ?
+                                          WIFI_IMAGE_TRANSFER_FLAG_RGB565_MSB_FIRST : 0u) |
+                                          ((TC4_CFG_COLOR_BGR565 != 0u) ?
+                                          WIFI_IMAGE_TRANSFER_FLAG_BGR565 : 0u));
 }
 
 uint8 WifiImageTransfer_SubmitText(const char *text, uint16 text_length)

@@ -1,0 +1,165 @@
+{
+  "format": "IMGT-processing-config",
+  "version": 2,
+  "ipm": {
+    "near_x": 0.2,
+    "far_x": 2.0,
+    "half_width_y": 0.75,
+    "output_width": 240,
+    "output_height": 240,
+    "calibration": {
+      "reference_width": 160,
+      "reference_height": 128,
+      "fx": 86.0473887,
+      "fy": 88.6329816,
+      "cx": 82.4574101,
+      "cy": 66.3210952,
+      "skew": 0.0,
+      "radial_count": 2,
+      "k": [
+        0.018489635,
+        -0.028478149,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "p1": 0.0,
+      "p2": 0.0,
+      "homography": [
+        0.00126378934,
+        0.176208985,
+        -48.1200764,
+        0.447881955,
+        0.00593926103,
+        -36.8896207,
+        0.0173753584,
+        -1.03867922,
+        1.0
+      ]
+    }
+  },
+  "colour_detection": {
+    "colours": [
+      {
+        "name": "橙色",
+        "threshold": {
+          "h_min": 0,
+          "h_max": 45,
+          "s_min": 120,
+          "s_max": 240,
+          "l_min": 50,
+          "l_max": 160,
+          "area_min": 50,
+          "area_max": 12000,
+          "width_min": 2,
+          "height_min": 3,
+          "fill_min_permille": 70,
+          "aspect_min_permille": 300,
+          "aspect_max_permille": 5000
+        },
+        "preview_rgb": [
+          255,
+          165,
+          0
+        ]
+      },
+      {
+        "name": "蓝色",
+        "threshold": {
+          "h_min": 120,
+          "h_max": 155,
+          "s_min": 120,
+          "s_max": 240,
+          "l_min": 0,
+          "l_max": 160,
+          "area_min": 50,
+          "area_max": 12000,
+          "width_min": 2,
+          "height_min": 3,
+          "fill_min_permille": 70,
+          "aspect_min_permille": 300,
+          "aspect_max_permille": 5000
+        },
+        "preview_rgb": [
+          0,
+          0,
+          255
+        ]
+      },
+      {
+        "name": "紫色",
+        "threshold": {
+          "h_min": 155,
+          "h_max": 190,
+          "s_min": 60,
+          "s_max": 240,
+          "l_min": 0,
+          "l_max": 160,
+          "area_min": 50,
+          "area_max": 12000,
+          "width_min": 2,
+          "height_min": 3,
+          "fill_min_permille": 70,
+          "aspect_min_permille": 300,
+          "aspect_max_permille": 5000
+        },
+        "preview_rgb": [
+          128,
+          0,
+          255
+        ]
+      },
+      {
+        "name": "黑色",
+        "threshold": {
+          "h_min": 0,
+          "h_max": 240,
+          "s_min": 0,
+          "s_max": 40,
+          "l_min": 0,
+          "l_max": 40,
+          "area_min": 40,
+          "area_max": 12000,
+          "width_min": 2,
+          "height_min": 3,
+          "fill_min_permille": 70,
+          "aspect_min_permille": 300,
+          "aspect_max_permille": 5000
+        },
+        "preview_rgb": [
+          128,
+          128,
+          128
+        ]
+      },
+      {
+        "name": "绿色",
+        "threshold": {
+          "h_min": 85,
+          "h_max": 115,
+          "s_min": 80,
+          "s_max": 240,
+          "l_min": 25,
+          "l_max": 160,
+          "area_min": 10,
+          "area_max": 12000,
+          "width_min": 2,
+          "height_min": 3,
+          "fill_min_permille": 70,
+          "aspect_min_permille": 300,
+          "aspect_max_permille": 5000
+        },
+        "preview_rgb": [
+          0,
+          255,
+          0
+        ]
+      }
+    ],
+    "roi_top_percent": 0,
+    "roi_left_percent": 0,
+    "roi_right_percent": 100,
+    "maximum_components": 12
+  }
+}

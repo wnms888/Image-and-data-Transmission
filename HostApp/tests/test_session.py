@@ -98,6 +98,20 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(self.app._closing)
         self.assertEqual(self.path.read_bytes(), previous)
 
+    def test_pixel_layout_is_exported_and_restored_with_processing_parameters(self):
+        self.app.pixel_layout_var.set("BGR565 · 低字节优先")
+        config = self.app._colour_config_for_export()
+        self.assertEqual(config.pixel_layout, "bgr565_lsb")
+        self.app.close()
+        self.assertEqual(load_processing_config(self.path)[1].pixel_layout, "bgr565_lsb")
+        self.wait_closed()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.report_callback_exception = lambda *args: self.callback_errors.append(args)
+        self.app = ImageTransmissionApp(self.root, self.path)
+        self.assertEqual(self.app.pixel_layout_var.get(), "BGR565 · 低字节优先")
+        self.assertEqual(self.app.colour_pane.get_config(), config)
+
     def test_exit_is_responsive_and_finishes_queued_pngs(self):
         recording = self.app.frame_saver.start_recording()
         def slow_png(*args):

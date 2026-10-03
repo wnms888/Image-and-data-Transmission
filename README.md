@@ -7,14 +7,16 @@
 ```text
 EmbedCode/
   WifiImageTransfer.c/.h   嵌入式 WiFi 图像、日志帧与 Printf 接口
-  CameraIPM.c/.h           共享标定的像素/地面坐标逆透视映射
+  CameraIPM.c/.h           共享标定的点映射与完整逆透视图像采样
   ColorDetection.c/.h      可配置颜色列表的 HSL 检测
   TC4ImageProcessingConfig.h 上位机导出的唯一嵌入式图像处理配置文件
+  README.md               处理顺序、接口契约及单头文件同步说明
 HostApp/
   monitor.py               可缩放图形化上位机
   protocol.py              IMGT v1 分帧、校验、RGB565 解码和 PNG 编码
   oscilloscope.py          通过校验的数值日志多通道示波器
   image_processing.py      逆透视与多颜色 HSL 检测实时预览
+  processing_configs/      带时间戳的 JSON/C 参数导出与上次会话参数
   receiver.py              TCP 监听/客户端、串口接收
   frame_saver.py           后台 PNG 单帧/连续帧保存
   启动上位机.bat           Windows 推荐启动入口
@@ -85,9 +87,10 @@ netsh advfirewall show currentprofile
 - **颜色检测**：顶部固定提供“增加颜色”和“减少颜色”按钮，默认提供红、黄两项，也可任意新增或移除颜色规则。每项独立设置名称、标记色、HSL 六个阈值和面积上下限，均可在页面内直接输入；“高级阈值”可继续设置宽高、填充率和纵横比。按列表顺序匹配，重叠阈值由排在前面的颜色优先。ROI 和每色最大组件数仍可调整；蓝色等任意色相均可检测。
 - **像素取值**：颜色检测页的实时原图支持鼠标悬停显示原始像素坐标及 H/S/L（0–240），等比缩放和新帧更新时也能准确读取。
 - **流畅预览**：颜色检测与逆透视后台处理，仅保留最新待处理帧；图像缩放、颜色分类缓存和隐藏页面跳过绘制降低占用。预览最高约 30 次/秒，接收统计和全部帧保存独立工作。
-- **自动记忆参数**：“退出”和窗口关闭按钮先保存完整处理参数到 `HostApp/last_processing_config.json`；下次启动自动恢复，首次可读取已有 `imgt_processing_config.json`。保存失败会保留窗口与上次成功保存的配置；退出时在后台等待已排队的 PNG 写完。
+- **框选自动阈值**：每种颜色的“高级阈值…”与“移除”之间提供“框选自动阈值”。点击后原图/结果暂时固定，在原图按住左键框选对应色块，松开后后台计算并填写该颜色的 HSL 六个阈值；支持反向拖动、等比缩放和跨 H=0 的红色，Esc 或右键取消。尽量紧贴色块、不包含背景；面积等几何参数不变，自动结果仍可手动微调。
+- **自动记忆参数**：“退出”和窗口关闭按钮先保存完整处理参数到 `HostApp/processing_configs/last_processing_config.json`；下次启动自动恢复，旧版 `HostApp/last_processing_config.json` 和 `imgt_processing_config.json` 仍兼容读取，不移动、不删除原文件。保存失败会保留窗口与上次成功保存的配置；退出时在后台等待已排队的 PNG 写完。
 
-“导出配置（JSON + C）”会保存可再次导入上位机的 UTF-8 JSON，并生成可直接覆盖到嵌入式工程的完整 C 头文件；“导入处理配置”读取 JSON 恢复两页参数。
+“导出配置（JSON + C）”默认打开 `HostApp/processing_configs/`，文件名自动带北京时间，例如 `imgt_processing_config_261003_1454.json`；同一分钟已有同名记录时追加 `_02` 等后缀。对应 C 配置与 JSON 放在同一目录，项目内 `EmbedCode/TC4ImageProcessingConfig.h` 仍同步更新。导入也默认打开此目录，可自行选择其它位置。自动记忆文件保持固定名称，不与时间戳导出混淆。
 
 ## 颜色异常排查
 
@@ -97,9 +100,9 @@ netsh advfirewall show currentprofile
 
 1. 红蓝相反：选择 `BGR565 · 高字节优先`。
 2. 颜色仍明显错误：尝试对应的低字节优先选项。
-3. 重新编译嵌入式端后可选择“自动”，上位机会读取包头 bit 0 的字节序标志。
+3. 重新编译嵌入式端后可选择“自动”，上位机会读取包头 bit 0 的字节序和 bit 2 的 RGB/BGR 标志。
 
-嵌入式端默认以 `WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST = 1u` 标注 SCC8660 图像流。若 `image` 缓冲已被驱动转换为 CPU 小端 RGB565，则在工程配置中覆盖为 `0u`。
+正确选择上位机图像格式后导出配置，字节序和 RGB/BGR 顺序会一并写入 `TC4ImageProcessingConfig.h`。颜色解码和 WiFi 包头均读取该文件，禁止另外覆盖冲突的 `WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST`。这些参数只解释原始内存，不会修改相机驱动或转换像素。
 
 ## Printf 重定向
 
@@ -133,7 +136,11 @@ printf("[warning] channel_data: %d, %d, %d, %d\n", 12, 13, 14, 15);
 
 首次接入时，将本仓库更新后的 `CameraIPM.c/.h`、`ColorDetection.c/.h` 和 `TC4ImageProcessingConfig.h` 放入嵌入式工程并重新编译。新版 `ColorDetectionResult` 使用 `colours[i].count` 和 `colours[i].cones[j]` 表示导出列表中第 `i` 种颜色（从 0 开始），替代旧的 `red_count/yellow_count` 和 `red/yellow` 数组；旧工程中引用这些字段的位置需一次性更新。此后每次在上位机增减颜色或调整逆透视、颜色阈值，只需点击导出、把导出的 `TC4ImageProcessingConfig.h` 整个覆盖到嵌入式工程同名文件，然后重新编译；不需要再修改任何 C 源文件。JSON 配置已升级为 v2，仍可导入旧版 v1 红黄配置。
 
-该文件同步相机标定参考尺寸、内参、畸变、单应矩阵、鸟瞰图范围和尺寸，以及有序颜色列表的 HSL/最小面积等几何阈值、ROI 百分比和每色最大组件数。嵌入式端会按 SCC8660 实际尺寸换算标定坐标，颜色 ROI 也按百分比换算，因此与上位机预览采用同一组定义。`Camera_GetIpmViewConfig()` 可直接取得导出的鸟瞰图范围；`Camera_GroundToRawPixel()` 和 `Camera_RawPixelToGround()` 使用同一份标定。
+首次升级还须同步新版 `WifiImageTransfer.c/.h`，它们与颜色检测共用配置中的像素布局，之后不再单独修改字节序开关。完整流程、接口返回值和缓冲区要求见 [嵌入式接入说明](EmbedCode/README.md)。
+
+该文件同步标定、鸟瞰图范围/尺寸、有序颜色 HSL/面积/几何阈值、ROI、每色组件数、预览标记色和像素字节/通道布局。阈值表只读，颜色数量与数组尺寸自动由宏生成；修改参数后只需完整覆盖 `TC4ImageProcessingConfig.h` 并重新编译烧录。调用方数组应使用 `CAMERA_IPM_OUTPUT_*` 和 `COLOR_DETECTION_COLOR_COUNT`，不要硬编码尺寸和红/黄数量。C 配置头现为 v2（区别于 IMGT v1 传输协议）。
+
+核对后已修正 ROI 舍入/空边界、白板 ROI 串用、像素格式不同步及逆透视单精度舍入差异，并补齐 `Camera_RenderIpmRgb565()` 和可选颜色掩码输出接口。两条图像分支都输入同一张稳定**原始图像**，不是先逆透视再颜色检测；颜色掩码与逆透视结果已通过真实 C/Python 逐像素对比。嵌入式额外的底点地面坐标和白板方向信息不属于上位机颜色掩码输出。完整板端主循环/DMA 工程未包含在仓库中，实际硬件时序及缓冲稳定性仍需实机确认。
 
 ## 数据帧
 
@@ -146,4 +153,4 @@ Set-Location HostApp
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖 TCP 分片重组、CRC/重同步与缺失 CRC 丢弃、Printf 格式、示波器暂停/历史回看模型、RGB565 高低字节解码、逆透视/颜色检测、JSON 与嵌入式 C 配置导出、等比缩放、PNG 保存和串口描述展示。
+测试覆盖 TCP 分片/CRC、Printf、示波器模型、图像解码/处理、配置同步、PNG 保存、串口描述和真实 Tk 参数恢复/退出。跨端测试会实际编译 `EmbedCode` 三个 C 模块，比较四种像素布局下全部 65,536 个 WORD 的 HSL、逆透视和颜色掩码逐像素结果，并验证只更换配置头即可调整颜色数量和输出尺寸。Windows 需 Visual Studio C++ Build Tools；无 C 编译器时该部分明确跳过。驱动桩仅位于 `HostApp/tests/embedded_fixture`，不得加入嵌入式编译。

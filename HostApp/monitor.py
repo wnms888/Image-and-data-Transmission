@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import queue
 import threading
@@ -29,6 +30,7 @@ from protocol import (
     PIXEL_LAYOUT_BGR565_MSB,
     PIXEL_LAYOUT_RGB565_LSB,
     PIXEL_LAYOUT_RGB565_MSB,
+    PIXEL_FLAG_RGB565_MSB_FIRST,
     Packet,
     RawPrintfParser,
     StreamParser,
@@ -37,6 +39,7 @@ from protocol import (
     resize_rgb888_nearest,
     rgb565_to_rgb888,
     rgb888_to_ppm,
+    resolve_pixel_layout,
 )
 from receiver import InputWorker, available_serial_ports
 import theme as ui
@@ -110,11 +113,25 @@ class LogPane(ttk.Frame):
         self.text.configure(state="disabled")
 
 
+def timestamped_processing_filename(directory: Path, now: datetime | None = None) -> str:
+    """China-local minute timestamp; keep earlier exports within the same minute."""
+    stamp = (now or datetime.now(timezone(timedelta(hours=8)))).strftime("%y%m%d_%H%M")
+    stem = f"imgt_processing_config_{stamp}"
+    name = stem
+    number = 2
+    while ((directory / f"{name}.json").exists()
+           or (directory / f"{name}_embedded_config.h").exists()):
+        name = f"{stem}_{number:02d}"
+        number += 1
+    return f"{name}.json"
+
+
 class ImageTransmissionApp:
     def __init__(self, root: tk.Tk, processing_state_path: Path | None = None) -> None:
         self.root = root
+        self.processing_config_directory = Path(__file__).resolve().parent / "processing_configs"
         self.processing_state_path = (Path(processing_state_path) if processing_state_path is not None
-                                      else Path(__file__).resolve().parent / "last_processing_config.json")
+                                      else self.processing_config_directory / "last_processing_config.json")
         self._closing = False
         self._shutdown_complete = threading.Event()
         self._shutdown_error = ""
@@ -741,11 +758,16 @@ class ImageTransmissionApp:
             self.colour_pane.update_frame(self._source_rgb, packet.width, packet.height)
 
     def export_processing_config(self) -> None:
+        try:
+            self.processing_config_directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            messagebox.showerror("无法创建配置目录", str(error), parent=self.root)
+            return
         path = filedialog.asksaveasfilename(
             parent=self.root,
             title="导出图像处理配置",
-            initialdir=str(Path(__file__).resolve().parent),
-            initialfile="imgt_processing_config.json",
+            initialdir=str(self.processing_config_directory),
+            initialfile=timestamped_processing_filename(self.processing_config_directory),
             defaultextension=".json",
             filetypes=(("JSON 配置文件", "*.json"), ("所有文件", "*.*")),
         )
@@ -753,7 +775,7 @@ class ImageTransmissionApp:
             return
         try:
             ipm_config = self.ipm_pane.get_config()
-            colour_config = self.colour_pane.get_config()
+            colour_config = self._colour_config_for_export()
             save_processing_config(path, ipm_config, colour_config)
             json_path = Path(path)
             copy_header_path = json_path.with_name(f"{json_path.stem}_embedded_config.h")
@@ -775,7 +797,7 @@ class ImageTransmissionApp:
         path = filedialog.askopenfilename(
             parent=self.root,
             title="导入图像处理配置",
-            initialdir=str(Path(__file__).resolve().parent),
+            initialdir=str(self.processing_config_directory),
             filetypes=(("JSON 配置文件", "*.json"), ("所有文件", "*.*")),
         )
         if not path:
@@ -784,6 +806,7 @@ class ImageTransmissionApp:
             ipm_config, colour_config = load_processing_config(path)
             self.ipm_pane.apply_config(ipm_config)
             self.colour_pane.apply_config(colour_config)
+            self._restore_pixel_layout(colour_config.pixel_layout)
         except (OSError, ValueError, ProcessingConfigError) as error:
             messagebox.showerror("导入失败", str(error), parent=self.root)
             return
@@ -794,18 +817,41 @@ class ImageTransmissionApp:
         """Restore the last session, or an existing export on the first launch."""
         source = self.processing_state_path
         if not source.exists():
-            source = Path(__file__).resolve().parent / "imgt_processing_config.json"
+            # Preserve old user files; migrate by saving to the new location on exit.
+            app_directory = Path(__file__).resolve().parent
+            source = next((candidate for candidate in (
+                app_directory / "last_processing_config.json",
+                self.processing_config_directory / "imgt_processing_config.json",
+                app_directory / "imgt_processing_config.json",
+            ) if candidate.exists()), source)
         if not source.exists():
             return
         try:
             ipm, colour = load_processing_config(source)
             self.ipm_pane.apply_config(ipm)
             self.colour_pane.apply_config(colour)
+            self._restore_pixel_layout(colour.pixel_layout)
         except (OSError, ValueError, tk.TclError) as error:
             self.storage_info_var.set(f"自动恢复配置失败：{source.name}；当前使用默认参数")
             self._append_system_error(f"自动恢复处理参数失败：{source}：{error}")
             return
         self.storage_info_var.set(f"已自动恢复处理参数：{source.name}")
+
+    def _colour_config_for_export(self):
+        """Capture the decoder setting together with detector parameters."""
+        config = self.colour_pane.get_config()
+        selected = self._selected_pixel_layout()
+        if selected == PIXEL_LAYOUT_AUTO and self.last_image_packet is None:
+            # Before the first packet, preserve the restored concrete layout
+            # instead of guessing and silently changing a BGR/LSB camera.
+            layout = config.pixel_layout
+        else:
+            flags = self.last_image_packet.flags if self.last_image_packet else PIXEL_FLAG_RGB565_MSB_FIRST
+            layout = resolve_pixel_layout(selected, flags)
+        return replace(config, pixel_layout=layout)
+
+    def _restore_pixel_layout(self, layout: str) -> None:
+        self.pixel_layout_var.set(next(label for label, value in PIXEL_LAYOUTS.items() if value == layout))
 
     def _append_system_error(self, text: str) -> None:
         from protocol import DebugMessage
@@ -839,8 +885,9 @@ class ImageTransmissionApp:
         try:
             # Read entry variables directly, including edits that still have
             # keyboard focus. Invalid edits or a disk error keep the app open.
+            self.processing_state_path.parent.mkdir(parents=True, exist_ok=True)
             save_processing_config(self.processing_state_path,
-                                   self.ipm_pane.get_config(), self.colour_pane.get_config())
+                                   self.ipm_pane.get_config(), self._colour_config_for_export())
         except (OSError, ValueError, tk.TclError) as error:
             messagebox.showerror("无法保存处理参数", f"参数未保存，软件保持打开。请修正参数或保存路径后再次退出。\n\n{error}",
                                  parent=self.root)
@@ -879,7 +926,10 @@ class ImageTransmissionApp:
             if self._shutdown_error:
                 messagebox.showerror("结束后台任务失败", f"处理参数已保存。\n{self._shutdown_error}", parent=self.root)
             for callback in self.root.tk.call("after", "info"):
-                self.root.after_cancel(callback)
+                # Cancel scheduled scripts without deleting a child widget's
+                # registered Python command from the wrong owner. destroy()
+                # then releases each widget's commands exactly once.
+                self.root.tk.call("after", "cancel", callback)
             self.root.destroy()
             return
         saved = self.frame_saver.stats()[0]

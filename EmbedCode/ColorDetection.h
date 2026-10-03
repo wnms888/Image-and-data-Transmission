@@ -17,6 +17,9 @@
 
 #include "Header.h"
 #include "TC4ImageProcessingConfig.h"
+#if TC4_IMAGE_PROCESSING_CONFIG_VERSION != 2u
+#error Export and replace the complete v2 TC4ImageProcessingConfig.h
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,13 +36,12 @@ extern "C" {
 #define COLOR_DETECTION_PERCENT_TO_Y(percent) \
     ((uint16)(((uint32)SCC8660_H * (uint32)(percent) + 50u) / 100u))
 
-/* Detect cones only in the lower half of the camera image. This excludes the
- * upper-background region while retaining the complete image width.
- */
+/* Configured ROI: left inclusive, right EXCLUSIVE. An empty rounded ROI
+ * is legal and detects nothing; never subtract 1 from an unsigned boundary. */
 #define COLOR_DETECTION_ROI_X_MIN            \
     (COLOR_DETECTION_PERCENT_TO_X(TC4_CFG_COLOR_ROI_LEFT_PERCENT))
-#define COLOR_DETECTION_ROI_X_MAX            \
-    (COLOR_DETECTION_PERCENT_TO_X(TC4_CFG_COLOR_ROI_RIGHT_PERCENT) - 1u)
+#define COLOR_DETECTION_ROI_X_END            \
+    (COLOR_DETECTION_PERCENT_TO_X(TC4_CFG_COLOR_ROI_RIGHT_PERCENT))
 #define COLOR_DETECTION_ROI_Y_MIN            \
     (COLOR_DETECTION_PERCENT_TO_Y(TC4_CFG_COLOR_ROI_TOP_PERCENT))
 #define COLOR_DETECTION_ROI_Y_MAX            (SCC8660_H - 1u)
@@ -53,9 +55,8 @@ extern "C" {
 #define COLOR_DETECTION_BOTTOM_BAND_ROWS     (TC4_CFG_COLOR_BOTTOM_BAND_ROWS)
 #define COLOR_DETECTION_BOTTOM_MIN_PIXELS    (TC4_CFG_COLOR_BOTTOM_MIN_PIXELS)
 
-/* White sign-board detection. A pixel is white only when every channel is
- * bright and its chroma is low.  The component-area limit is evaluated in the
- * same lower-half ROI used for cone detection. */
+/* Additional embedded-only white-board metadata, AFTER common colour
+ * detection. It has its OWN vertical ROI and never changes the preview mask. */
 #define COLOR_DETECTION_WHITE_MIN_CHANNEL    (TC4_CFG_WHITE_MIN_CHANNEL)
 #define COLOR_DETECTION_WHITE_MAX_CHROMA     (TC4_CFG_WHITE_MAX_CHROMA)
 #define COLOR_DETECTION_WHITE_MIN_AREA       (TC4_CFG_WHITE_MIN_AREA)
@@ -63,9 +64,9 @@ extern "C" {
     (COLOR_DETECTION_PERCENT_TO_Y(TC4_CFG_WHITE_ROI_TOP_PERCENT))
 #define COLOR_DETECTION_WHITE_ROI_Y_MAX      (SCC8660_H - 1u)
 
-/* Copy SCC8660 DMA image before processing.
- * This avoids processing a buffer that can be overwritten by the next frame.
- * Cost: SCC8660_W*SCC8660_H*2 bytes extra RAM and one frame memcpy.
+/* Optional camera snapshot, SCC8660_W*SCC8660_H*2 extra bytes plus memcpy.
+ * The caller still needs driver ownership/locking during the copy. A memcpy
+ * alone cannot prevent concurrent DMA writes or guarantee a coherent frame.
  */
 #define COLOR_DETECTION_COPY_CAMERA_FRAME    (TC4_CFG_COLOR_COPY_CAMERA_FRAME)
 
@@ -109,7 +110,7 @@ typedef struct
     uint16 ymax;
     uint16 width;
     uint16 height;
-    uint16 area;
+    uint32 area;
 
     uint16 fill_permille;
     uint16 aspect_permille;
@@ -132,7 +133,7 @@ typedef struct
 
     /* Set when one connected, neutral-white region reaches WHITE_MIN_AREA. */
     uint8 large_white_detected;
-    uint16 largest_white_component_area;
+    uint32 largest_white_component_area;
 
     /* Bottom-center contact of the largest valid white sign-board region.
      * IPM uses this ground-plane point; the angle is atan2(y, x), relative to
@@ -146,26 +147,54 @@ typedef struct
 
     /* Debug/performance counters. */
     uint32 roi_pixels;
-    uint32 fast_rejected_pixels;
+    uint32 fast_rejected_pixels; /* Reserved, always zero: no blue rejection. */
     uint32 hsl_conversions;
     uint32 white_candidate_pixels;
-    uint16 connected_components;
-    uint16 rejected_components;
-    uint16 white_connected_components;
+    uint32 connected_components;
+    uint32 rejected_components;
+    uint32 white_connected_components;
 } ColorDetectionResult;
 
-/* Runtime-adjustable thresholds. */
-extern ColorDetectionThreshold g_color_detection_thresholds[COLOR_DETECTION_COLOR_COUNT];
+/* Read-only tables from the single exported header; index is 0-based.
+ * Unsized declaration permits compile-time validation of initializer count. */
+extern const ColorDetectionThreshold g_color_detection_thresholds[];
+extern const uint8 g_color_detection_preview_rgb[][3];
+
+/* Bounds-checked access; returns NULL for an out-of-range colour index. */
+const ColorDetectionThreshold *ColorDetection_GetThreshold(uint16 color_index);
+
+/* Decode a camera-memory WORD and convert to HSL 0..240 using the configured
+ * byte/channel order. Returns 0 for any NULL output, otherwise 1. */
+uint8 ColorDetection_Rgb565ToHsl(uint16 raw, uint8 *h, uint8 *s, uint8 *l);
 
 /* Clear result/state. No camera reconfiguration is performed here. */
 void ColorDetection_Init(void);
 
-/* Process an already stable RGB565 frame. */
+/* Process an already stable ORIGINAL RGB565 frame. Clears result each call;
+ * returns total accepted components, 0 for invalid pointers or no matches.
+ * Order: ROI -> RGB888 -> integer HSL -> first matching rule -> 4-connected
+ * components -> geometry -> per-colour count cap -> ground-contact metadata
+ * -> independent white-board metadata. No IPM image is an input here.
+ * Non-reentrant: use only one CPU/task at a time (shared static workspace).
+ * Keep input stable until return; result is owned by caller. */
 uint32 ColorDetection_ProcessImage(
     const uint16 image[SCC8660_H][SCC8660_W],
     ColorDetectionResult *result);
 
-/* Safe convenience wrapper for the SCC8660 DMA buffer.
+/* Same processing, optionally paints the HOST-EQUIVALENT RGB888 result:
+ * accepted pixels = exported preview colour, bbox border = white, rest black.
+ * NULL preview saves painting cost and frame-sized output RAM. Non-NULL output
+ * must not overlap source/result and requires W*H*3 bytes owned by caller.
+ * This is a RGB888 image, NOT a packet accepted by SubmitRgb565Frame(). */
+uint32 ColorDetection_ProcessImageWithPreview(
+    const uint16 image[SCC8660_H][SCC8660_W],
+    ColorDetectionResult *result,
+    uint8 preview[SCC8660_H][SCC8660_W][3]);
+
+/* Convenience wrapper for SCC8660 DMA buffer, with ownership precondition:
+ * ensure the driver cannot overwrite the completed frame while processing,
+ * or while taking the optional copy. Prefer ProcessImage on your stable frame.
+ * This function consumes/clears scc8660_finish_flag.
  * Returns 1 when a completed frame was consumed and processed, otherwise 0.
  */
 uint8 ColorDetection_ProcessCameraFrame(ColorDetectionResult *result);

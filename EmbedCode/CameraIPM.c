@@ -1,284 +1,171 @@
-/*
- * CameraIPM.c
- *
- * Runtime:
- *   distorted raw pixel (u_d, v_d)
- *       -> iterative point undistortion
- *       -> undistorted pixel (u_u, v_u)
- *       -> 3x3 homography
- *       -> vehicle-ground coordinate (X,Y)
+/* Host-equivalent reverse image sampling, plus ground-contact point mapping.
+ * Configuration is read only from TC4ImageProcessingConfig.h via CameraIPM.h.
+ * Binary64 operation order deliberately mirrors HostApp/image_processing.py.
  */
-
-#include "Header.h"
 #include "CameraIPM.h"
+#include <math.h>
+#include <string.h>
 
-static bool Camera_UndistortPoint(
-    float ud,
-    float vd,
-    float *uu,
-    float *vu)
+typedef char CameraRequiresBinary64Double[sizeof(double) == 8 ? 1 : -1];
+#ifdef __FAST_MATH__
+#error Disable fast-math to preserve host-equivalent IPM sampling
+#endif
+
+static bool camera_inverse_h(double inverse[9])
 {
-    float x;
-    float y;
-    float xd;
-    float yd;
-    uint32_t iter;
-
-    if ((uu == 0) || (vu == 0))
-    {
-        return false;
-    }
-
-    if ((fabsf(CAMERA_FX) < 1.0e-12f) ||
-        (fabsf(CAMERA_FY) < 1.0e-12f))
-    {
-        return false;
-    }
-
-    yd = (vd - CAMERA_CY) / CAMERA_FY;
-    xd = (ud - CAMERA_CX - CAMERA_SKEW * yd) / CAMERA_FX;
-
-    x = xd;
-    y = yd;
-
-    for (iter = 0u; iter < 8u; ++iter)
-    {
-        const float x2 = x * x;
-        const float y2 = y * y;
-        const float r2 = x2 + y2;
-        const float r4 = r2 * r2;
-        const float r6 = r4 * r2;
-
-        const float k1 = CAMERA_K[0];
-        const float k2 = CAMERA_K[1];
-        const float k3 =
-            (CAMERA_RADIAL_COUNT >= 3u) ? CAMERA_K[2] : 0.0f;
-        const float k4 =
-            (CAMERA_RADIAL_COUNT >= 6u) ? CAMERA_K[3] : 0.0f;
-        const float k5 =
-            (CAMERA_RADIAL_COUNT >= 6u) ? CAMERA_K[4] : 0.0f;
-        const float k6 =
-            (CAMERA_RADIAL_COUNT >= 6u) ? CAMERA_K[5] : 0.0f;
-
-        const float radial_num =
-            1.0f + k1 * r2 + k2 * r4 + k3 * r6;
-
-        const float radial_den =
-            1.0f + k4 * r2 + k5 * r4 + k6 * r6;
-
-        float radial;
-        float delta_x;
-        float delta_y;
-
-        if ((fabsf(radial_num) < 1.0e-12f) ||
-            (fabsf(radial_den) < 1.0e-12f))
-        {
-            return false;
-        }
-
-        radial = radial_num / radial_den;
-
-        delta_x =
-            2.0f * CAMERA_P1 * x * y +
-            CAMERA_P2 * (r2 + 2.0f * x2);
-
-        delta_y =
-            CAMERA_P1 * (r2 + 2.0f * y2) +
-            2.0f * CAMERA_P2 * x * y;
-
-        x = (xd - delta_x) / radial;
-        y = (yd - delta_y) / radial;
-
-        if ((!isfinite(x)) || (!isfinite(y)))
-        {
-            return false;
-        }
-    }
-
-    *uu = CAMERA_FX * x + CAMERA_SKEW * y + CAMERA_CX;
-    *vu = CAMERA_FY * y + CAMERA_CY;
-
-    return isfinite(*uu) && isfinite(*vu);
+    const double a=CAMERA_IPM_H[0], b=CAMERA_IPM_H[1], c=CAMERA_IPM_H[2];
+    const double d=CAMERA_IPM_H[3], e=CAMERA_IPM_H[4], f=CAMERA_IPM_H[5];
+    const double g=CAMERA_IPM_H[6], h=CAMERA_IPM_H[7], i=CAMERA_IPM_H[8];
+    double determinant;
+    uint16 n;
+    inverse[0]=e*i-f*h; inverse[1]=c*h-b*i; inverse[2]=b*f-c*e;
+    inverse[3]=f*g-d*i; inverse[4]=a*i-c*g; inverse[5]=c*d-a*f;
+    inverse[6]=d*h-e*g; inverse[7]=b*g-a*h; inverse[8]=a*e-b*d;
+    determinant = a*inverse[0]+b*inverse[3]+c*inverse[6];
+    if (!isfinite(determinant) || fabs(determinant)<1.0e-12) return false;
+    for (n=0u; n<9u; ++n) inverse[n] /= determinant;
+    return true;
 }
 
-static bool Camera_IPMProjectUndistortedPoint(
-    float uu,
-    float vu,
-    CameraGround2f *ground)
+/* Forward distortion in normalized camera coordinates. */
+static bool camera_distort(double x, double y, double *ud, double *vd)
 {
-    float w;
-
-    if (ground == 0)
-    {
-        return false;
-    }
-
-    w =
-        CAMERA_IPM_H[6] * uu +
-        CAMERA_IPM_H[7] * vu +
-        CAMERA_IPM_H[8];
-
-    if (fabsf(w) < 1.0e-10f)
-    {
-        return false;
-    }
-
-    ground->x =
-        (CAMERA_IPM_H[0] * uu +
-         CAMERA_IPM_H[1] * vu +
-         CAMERA_IPM_H[2]) / w;
-
-    ground->y =
-        (CAMERA_IPM_H[3] * uu +
-         CAMERA_IPM_H[4] * vu +
-         CAMERA_IPM_H[5]) / w;
-
-    return isfinite(ground->x) && isfinite(ground->y);
-}
-
-static bool Camera_GroundToUndistortedPixel(
-    float ground_x,
-    float ground_y,
-    float *uu,
-    float *vu)
-{
-    const float a = CAMERA_IPM_H[0];
-    const float b = CAMERA_IPM_H[1];
-    const float c = CAMERA_IPM_H[2];
-    const float d = CAMERA_IPM_H[3];
-    const float e = CAMERA_IPM_H[4];
-    const float f = CAMERA_IPM_H[5];
-    const float g = CAMERA_IPM_H[6];
-    const float h = CAMERA_IPM_H[7];
-    const float i = CAMERA_IPM_H[8];
-    const float c00 = e * i - f * h;
-    const float c01 = c * h - b * i;
-    const float c02 = b * f - c * e;
-    const float c10 = f * g - d * i;
-    const float c11 = a * i - c * g;
-    const float c12 = c * d - a * f;
-    const float c20 = d * h - e * g;
-    const float c21 = b * g - a * h;
-    const float c22 = a * e - b * d;
-    const float determinant = a * c00 + b * c10 + c * c20;
-    float w;
-
-    if ((uu == 0) || (vu == 0) || (fabsf(determinant) < 1.0e-12f))
-    {
-        return false;
-    }
-
-    w = (c20 * ground_x + c21 * ground_y + c22) / determinant;
-    if (fabsf(w) < 1.0e-10f)
-    {
-        return false;
-    }
-
-    *uu = ((c00 * ground_x + c01 * ground_y + c02) / determinant) / w;
-    *vu = ((c10 * ground_x + c11 * ground_y + c12) / determinant) / w;
-    return isfinite(*uu) && isfinite(*vu);
-}
-
-bool Camera_RawPixelToGround(
-    float ud,
-    float vd,
-    CameraGround2f *ground)
-{
-    float reference_ud;
-    float reference_vd;
-    float uu = 0.0f;
-    float vu = 0.0f;
-
-    if ((CAMERA_REFERENCE_WIDTH == 0u) || (CAMERA_REFERENCE_HEIGHT == 0u) ||
-        (SCC8660_W == 0u) || (SCC8660_H == 0u))
-    {
-        return false;
-    }
-
-    /* Host previews scale an incoming image to calibration resolution before
-     * applying the model.  Do the same for an SCC8660 frame here. */
-    reference_ud = ud * (float)CAMERA_REFERENCE_WIDTH / (float)SCC8660_W;
-    reference_vd = vd * (float)CAMERA_REFERENCE_HEIGHT / (float)SCC8660_H;
-
-    if (!Camera_UndistortPoint(reference_ud, reference_vd, &uu, &vu))
-    {
-        return false;
-    }
-
-    return Camera_IPMProjectUndistortedPoint(uu, vu, ground);
-}
-
-bool Camera_GroundToRawPixel(
-    float ground_x,
-    float ground_y,
-    float *ud,
-    float *vd)
-{
-    float uu;
-    float vu;
-    float x;
-    float y;
-    float r2;
-    float r4;
-    float r6;
-    float radial_num;
-    float radial_den;
-    float xd;
-    float yd;
-    float reference_ud;
-    float reference_vd;
-
-    if ((ud == 0) || (vd == 0) ||
-        (CAMERA_REFERENCE_WIDTH == 0u) || (CAMERA_REFERENCE_HEIGHT == 0u) ||
-        (SCC8660_W == 0u) || (SCC8660_H == 0u) ||
-        (fabsf(CAMERA_FX) < 1.0e-12f) || (fabsf(CAMERA_FY) < 1.0e-12f) ||
-        !Camera_GroundToUndistortedPixel(ground_x, ground_y, &uu, &vu))
-    {
-        return false;
-    }
-
-    y = (vu - CAMERA_CY) / CAMERA_FY;
-    x = (uu - CAMERA_CX - CAMERA_SKEW * y) / CAMERA_FX;
-    r2 = x * x + y * y;
-    r4 = r2 * r2;
-    r6 = r4 * r2;
-    radial_num = 1.0f + CAMERA_K[0] * r2 + CAMERA_K[1] * r4;
-    radial_den = 1.0f;
-    if (CAMERA_RADIAL_COUNT >= 3u)
-    {
-        radial_num += CAMERA_K[2] * r6;
-    }
-    if (CAMERA_RADIAL_COUNT >= 6u)
-    {
-        radial_den += CAMERA_K[3] * r2 + CAMERA_K[4] * r4 + CAMERA_K[5] * r6;
-    }
-    if (fabsf(radial_den) < 1.0e-12f)
-    {
-        return false;
-    }
-
-    radial_num /= radial_den;
-    xd = x * radial_num + 2.0f * CAMERA_P1 * x * y +
-         CAMERA_P2 * (r2 + 2.0f * x * x);
-    yd = y * radial_num + CAMERA_P1 * (r2 + 2.0f * y * y) +
-         2.0f * CAMERA_P2 * x * y;
-    reference_ud = CAMERA_FX * xd + CAMERA_SKEW * yd + CAMERA_CX;
-    reference_vd = CAMERA_FY * yd + CAMERA_CY;
-    *ud = reference_ud * (float)SCC8660_W / (float)CAMERA_REFERENCE_WIDTH;
-    *vd = reference_vd * (float)SCC8660_H / (float)CAMERA_REFERENCE_HEIGHT;
+    const double r2=x*x+y*y, r4=r2*r2;
+#if CAMERA_RADIAL_COUNT >= 3u
+    const double r6=r4*r2;
+#endif
+    double numerator=1.0+CAMERA_K[0]*r2+CAMERA_K[1]*r4;
+    double denominator=1.0, radial, xd, yd;
+#if CAMERA_RADIAL_COUNT >= 3u
+    numerator += CAMERA_K[2]*r6;
+#endif
+#if CAMERA_RADIAL_COUNT >= 6u
+    denominator += CAMERA_K[3]*r2+CAMERA_K[4]*r4+CAMERA_K[5]*r6;
+#endif
+    if (fabs(denominator)<1.0e-12) return false;
+    radial=numerator/denominator;
+    xd=x*radial+2.0*CAMERA_P1*x*y+CAMERA_P2*(r2+2.0*x*x);
+    yd=y*radial+CAMERA_P1*(r2+2.0*y*y)+2.0*CAMERA_P2*x*y;
+    *ud=CAMERA_FX*xd+CAMERA_SKEW*yd+CAMERA_CX;
+    *vd=CAMERA_FY*yd+CAMERA_CY;
     return isfinite(*ud) && isfinite(*vd);
+}
+
+static bool camera_ground_to_reference(
+    double gx, double gy, const double inverse[9], double *ud, double *vd)
+{
+    const double w=inverse[6]*gx+inverse[7]*gy+inverse[8];
+    double uu, vu, x, y;
+    if (fabs(w)<1.0e-12 || fabs(CAMERA_FX)<1.0e-12 ||
+        fabs(CAMERA_FY)<1.0e-12) return false;
+    uu=(inverse[0]*gx+inverse[1]*gy+inverse[2])/w;
+    vu=(inverse[3]*gx+inverse[4]*gy+inverse[5])/w;
+    y=(vu-CAMERA_CY)/CAMERA_FY;
+    x=(uu-CAMERA_CX-CAMERA_SKEW*y)/CAMERA_FX;
+    return camera_distort(x, y, ud, vd);
+}
+
+/* Unlike C round(), Python round() selects the even integer at exact halves.
+ * Keep a double until after bounds checking to avoid integer overflow. */
+static double camera_round_even(double value)
+{
+    const double lower=floor(value), fraction=value-lower;
+    if (fraction<0.5) return lower;
+    if (fraction>0.5) return lower+1.0;
+    return fmod(lower, 2.0)==0.0 ? lower : lower+1.0;
+}
+
+bool Camera_RenderIpmRgb565(
+    const uint16 image[SCC8660_H][SCC8660_W],
+    uint16 output[CAMERA_IPM_OUTPUT_HEIGHT][CAMERA_IPM_OUTPUT_WIDTH])
+{
+    double inverse[9];
+    const double uscale=(double)SCC8660_W/CAMERA_REFERENCE_WIDTH;
+    const double vscale=(double)SCC8660_H/CAMERA_REFERENCE_HEIGHT;
+    uint16 oy, ox;
+    if (image==0 || output==0) return false;
+    if (TC4_IPM_VIEW_FAR_X<=TC4_IPM_VIEW_NEAR_X ||
+        TC4_IPM_VIEW_HALF_WIDTH_Y<=0.0 ||
+        !isfinite(TC4_IPM_VIEW_NEAR_X) || !isfinite(TC4_IPM_VIEW_FAR_X) ||
+        !isfinite(TC4_IPM_VIEW_HALF_WIDTH_Y) ||
+        fabs(CAMERA_FX)<1.0e-12 || fabs(CAMERA_FY)<1.0e-12 ||
+        !camera_inverse_h(inverse))
+    {
+        memset(output, 0, (size_t)CAMERA_IPM_OUTPUT_HEIGHT*CAMERA_IPM_OUTPUT_WIDTH*sizeof(uint16));
+        return false;
+    }
+    for (oy=0u; oy<CAMERA_IPM_OUTPUT_HEIGHT; ++oy)
+    {
+        const double fraction=(double)oy/(CAMERA_IPM_OUTPUT_HEIGHT-1u);
+        const double gx=TC4_IPM_VIEW_FAR_X-fraction*(TC4_IPM_VIEW_FAR_X-TC4_IPM_VIEW_NEAR_X);
+        for (ox=0u; ox<CAMERA_IPM_OUTPUT_WIDTH; ++ox)
+        {
+            const double yf=(double)ox/(CAMERA_IPM_OUTPUT_WIDTH-1u);
+            const double gy=TC4_IPM_VIEW_HALF_WIDTH_Y-yf*(2.0*TC4_IPM_VIEW_HALF_WIDTH_Y);
+            double u, v;
+            output[oy][ox]=0u;
+            if (!camera_ground_to_reference(gx, gy, inverse, &u, &v)) continue;
+            u=camera_round_even(u*uscale); v=camera_round_even(v*vscale);
+            if (u>=0.0 && u<SCC8660_W && v>=0.0 && v<SCC8660_H)
+                output[oy][ox]=image[(uint16)v][(uint16)u];
+        }
+    }
+    return true;
+}
+
+bool Camera_GroundToRawPixel(float gx, float gy, float *ud, float *vd)
+{
+    double inverse[9], u, v;
+    if (ud==0 || vd==0 || !camera_inverse_h(inverse) ||
+        !camera_ground_to_reference(gx, gy, inverse, &u, &v)) return false;
+    *ud=(float)(u*((double)SCC8660_W/CAMERA_REFERENCE_WIDTH));
+    *vd=(float)(v*((double)SCC8660_H/CAMERA_REFERENCE_HEIGHT));
+    return isfinite(*ud) && isfinite(*vd);
+}
+
+bool Camera_RawPixelToGround(float ud, float vd, CameraGround2f *ground)
+{
+    double xd, yd, x, y, uu, vu, w;
+    uint16 iter;
+    if (ground==0 || fabs(CAMERA_FX)<1.0e-12 || fabs(CAMERA_FY)<1.0e-12) return false;
+    yd=(vd*((double)CAMERA_REFERENCE_HEIGHT/SCC8660_H)-CAMERA_CY)/CAMERA_FY;
+    xd=(ud*((double)CAMERA_REFERENCE_WIDTH/SCC8660_W)-CAMERA_CX-CAMERA_SKEW*yd)/CAMERA_FX;
+    x=xd; y=yd;
+    for (iter=0u; iter<8u; ++iter)
+    {
+        const double r2=x*x+y*y, r4=r2*r2;
+#if CAMERA_RADIAL_COUNT >= 3u
+        const double r6=r4*r2;
+#endif
+        double numerator=1.0+CAMERA_K[0]*r2+CAMERA_K[1]*r4;
+        double denominator=1.0, radial, dx, dy;
+#if CAMERA_RADIAL_COUNT >= 3u
+        numerator += CAMERA_K[2]*r6;
+#endif
+#if CAMERA_RADIAL_COUNT >= 6u
+        denominator += CAMERA_K[3]*r2+CAMERA_K[4]*r4+CAMERA_K[5]*r6;
+#endif
+        if (fabs(numerator)<1.0e-12 || fabs(denominator)<1.0e-12) return false;
+        radial=numerator/denominator;
+        dx=2.0*CAMERA_P1*x*y+CAMERA_P2*(r2+2.0*x*x);
+        dy=CAMERA_P1*(r2+2.0*y*y)+2.0*CAMERA_P2*x*y;
+        x=(xd-dx)/radial; y=(yd-dy)/radial;
+        if (!isfinite(x) || !isfinite(y)) return false;
+    }
+    uu=CAMERA_FX*x+CAMERA_SKEW*y+CAMERA_CX; vu=CAMERA_FY*y+CAMERA_CY;
+    w=CAMERA_IPM_H[6]*uu+CAMERA_IPM_H[7]*vu+CAMERA_IPM_H[8];
+    if (fabs(w)<1.0e-12) return false;
+    ground->x=(float)((CAMERA_IPM_H[0]*uu+CAMERA_IPM_H[1]*vu+CAMERA_IPM_H[2])/w);
+    ground->y=(float)((CAMERA_IPM_H[3]*uu+CAMERA_IPM_H[4]*vu+CAMERA_IPM_H[5])/w);
+    return isfinite(ground->x) && isfinite(ground->y);
 }
 
 void Camera_GetIpmViewConfig(CameraIpmViewConfig *config)
 {
-    if (config == 0)
-    {
-        return;
-    }
-
-    config->near_x = TC4_IPM_VIEW_NEAR_X;
-    config->far_x = TC4_IPM_VIEW_FAR_X;
-    config->half_width_y = TC4_IPM_VIEW_HALF_WIDTH_Y;
-    config->output_width = (uint16)TC4_IPM_VIEW_OUTPUT_WIDTH;
-    config->output_height = (uint16)TC4_IPM_VIEW_OUTPUT_HEIGHT;
+    if (config==0) return;
+    config->near_x=TC4_IPM_VIEW_NEAR_X;
+    config->far_x=TC4_IPM_VIEW_FAR_X;
+    config->half_width_y=TC4_IPM_VIEW_HALF_WIDTH_Y;
+    config->output_width=(uint16)CAMERA_IPM_OUTPUT_WIDTH;
+    config->output_height=(uint16)CAMERA_IPM_OUTPUT_HEIGHT;
 }

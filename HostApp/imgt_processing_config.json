@@ -48,7 +48,7 @@
           "h_max": 45,
           "s_min": 120,
           "s_max": 240,
-          "l_min": 80,
+          "l_min": 50,
           "l_max": 160,
           "area_min": 50,
           "area_max": 12000,
@@ -116,10 +116,10 @@
           "h_min": 0,
           "h_max": 240,
           "s_min": 0,
-          "s_max": 35,
+          "s_max": 40,
           "l_min": 0,
-          "l_max": 35,
-          "area_min": 50,
+          "l_max": 40,
+          "area_min": 40,
           "area_max": 12000,
           "width_min": 2,
           "height_min": 3,
@@ -131,6 +131,29 @@
           128,
           128,
           128
+        ]
+      },
+      {
+        "name": "绿色",
+        "threshold": {
+          "h_min": 85,
+          "h_max": 115,
+          "s_min": 80,
+          "s_max": 240,
+          "l_min": 25,
+          "l_max": 160,
+          "area_min": 10,
+          "area_max": 12000,
+          "width_min": 2,
+          "height_min": 3,
+          "fill_min_permille": 70,
+          "aspect_min_permille": 300,
+          "aspect_max_permille": 5000
+        },
+        "preview_rgb": [
+          0,
+          255,
+          0
         ]
       }
     ],

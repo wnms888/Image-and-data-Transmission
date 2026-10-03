@@ -1,12 +1,17 @@
 /*
  * ColorDetection.c
  *
- * Ordered HSL classification + connected components + CameraIPM.
+ * Common image pipeline matches HostApp.detect_colours:
+ * ROI (half-up) -> RGB888 -> integer HSL -> first matching rule
+ * -> 4-connected components -> geometry -> count cap -> optional preview.
+ * Ground contact and neutral-white metadata are embedded-only extensions.
+ * All tunable values/tables come from TC4ImageProcessingConfig.h.
  */
 
 #include "Header.h"
 #include "ColorDetection.h"
 #include "CameraIPM.h"
+#include <string.h>
 
 #define CD_LABEL_NONE       ((CdLabel)0u)
 #if COLOR_DETECTION_COLOR_COUNT < 255u
@@ -25,10 +30,14 @@ typedef uint16 CdLabel;
 /* One or two bytes per pixel according to the exported colour count. */
 static CdLabel s_label_map[SCC8660_H][SCC8660_W];
 
-/* x < 256 and y < 256, therefore one uint16 can pack both coordinates:
- * high byte = y, low byte = x.
- */
-static uint16 s_bfs_queue[CD_IMAGE_PIXELS];
+/* Linear pixel indexes: no hidden x/y < 256 limit. Preserve the original
+ * two-byte queue cost for ordinary camera frames; grow only when necessary. */
+#if SCC8660_W * SCC8660_H <= 65535u
+typedef uint16 CdPixelIndex;
+#else
+typedef uint32 CdPixelIndex;
+#endif
+static CdPixelIndex s_bfs_queue[CD_IMAGE_PIXELS];
 
 /* Scratch arrays for robust bottom-contact extraction. */
 static uint32 s_row_x_sum[SCC8660_H];
@@ -38,10 +47,35 @@ static uint16 s_row_count[SCC8660_H];
 static uint16 s_frame_copy[SCC8660_H][SCC8660_W];
 #endif
 
-ColorDetectionThreshold g_color_detection_thresholds[COLOR_DETECTION_COLOR_COUNT] =
+const ColorDetectionThreshold g_color_detection_thresholds[] =
 {
     TC4_CFG_COLOR_THRESHOLDS
 };
+const uint8 g_color_detection_preview_rgb[][3] = { TC4_CFG_COLOR_PREVIEW_RGB };
+typedef char CdThresholdCountCheck[
+    sizeof(g_color_detection_thresholds)/sizeof(g_color_detection_thresholds[0])
+    == COLOR_DETECTION_COLOR_COUNT ? 1 : -1];
+typedef char CdPreviewCountCheck[
+    sizeof(g_color_detection_preview_rgb)/sizeof(g_color_detection_preview_rgb[0])
+    == COLOR_DETECTION_COLOR_COUNT ? 1 : -1];
+#if TC4_CFG_COLOR_ROI_LEFT_PERCENT >= TC4_CFG_COLOR_ROI_RIGHT_PERCENT || \
+    TC4_CFG_COLOR_ROI_RIGHT_PERCENT > 100u || TC4_CFG_COLOR_ROI_TOP_PERCENT > 100u || \
+    TC4_CFG_WHITE_ROI_TOP_PERCENT > 100u
+#error Invalid ROI percentages in TC4ImageProcessingConfig.h
+#endif
+#if COLOR_DETECTION_MAX_CONES < 1 || COLOR_DETECTION_MAX_CONES > 255
+#error Per-colour component cap must be between 1 and 255
+#endif
+#if TC4_CFG_COLOR_BGR565 > 1 || TC4_CFG_COLOR_SWAP_RGB565_BYTES > 1
+#error Camera byte/channel order flags must be 0 or 1
+#endif
+#if COLOR_DETECTION_BOTTOM_BAND_ROWS < 1 || COLOR_DETECTION_BOTTOM_BAND_ROWS > 65535 || \
+    COLOR_DETECTION_BOTTOM_MIN_PIXELS < 1 || COLOR_DETECTION_BOTTOM_MIN_PIXELS > 65535
+#error Invalid bottom-contact settings
+#endif
+#if COLOR_DETECTION_COPY_CAMERA_FRAME > 1
+#error Camera copy switch must be 0 or 1
+#endif
 
 typedef struct
 {
@@ -49,7 +83,7 @@ typedef struct
     uint16 xmax;
     uint16 ymin;
     uint16 ymax;
-    uint16 area;
+    uint32 area;
 } CdBlobStats;
 
 static uint16 cd_swap_u16(uint16 value)
@@ -88,6 +122,9 @@ static void cd_rgb565_to_rgb888(
         *r = (uint8)((r5 << 3) | (r5 >> 2));
         *g = (uint8)((g6 << 2) | (g6 >> 4));
         *b = (uint8)((b5 << 3) | (b5 >> 2));
+#if TC4_CFG_COLOR_BGR565
+        { const uint8 saved_r = *r; *r = *b; *b = saved_r; }
+#endif
     }
 }
 
@@ -230,7 +267,7 @@ static void cd_build_label_map(
          ++y)
     {
         for (x = COLOR_DETECTION_ROI_X_MIN;
-             x <= COLOR_DETECTION_ROI_X_MAX;
+             x < COLOR_DETECTION_ROI_X_END;
              ++x)
         {
             result->roi_pixels++;
@@ -239,19 +276,19 @@ static void cd_build_label_map(
     }
 }
 
-static uint16 cd_pack_xy(uint16 x, uint16 y)
+static CdPixelIndex cd_pack_xy(uint16 x, uint16 y)
 {
-    return (uint16)(((y & 0xFFu) << 8) | (x & 0xFFu));
+    return (CdPixelIndex)((uint32)y * SCC8660_W + x);
 }
 
-static uint16 cd_unpack_x(uint16 packed)
+static uint16 cd_unpack_x(CdPixelIndex packed)
 {
-    return (uint16)(packed & 0xFFu);
+    return (uint16)(packed % SCC8660_W);
 }
 
-static uint16 cd_unpack_y(uint16 packed)
+static uint16 cd_unpack_y(CdPixelIndex packed)
 {
-    return (uint16)((packed >> 8) & 0xFFu);
+    return (uint16)(packed / SCC8660_W);
 }
 
 static void cd_enqueue_if_same_label(
@@ -261,8 +298,9 @@ static void cd_enqueue_if_same_label(
     uint32 *tail)
 {
     if ((nx < (int)COLOR_DETECTION_ROI_X_MIN) ||
-        (nx > (int)COLOR_DETECTION_ROI_X_MAX) ||
-        (ny < (int)COLOR_DETECTION_ROI_Y_MIN) ||
+        (nx >= (int)COLOR_DETECTION_ROI_X_END) ||
+        (ny < (int)((label == CD_LABEL_WHITE) ?
+                    COLOR_DETECTION_WHITE_ROI_Y_MIN : COLOR_DETECTION_ROI_Y_MIN)) ||
         (ny > (int)COLOR_DETECTION_ROI_Y_MAX))
     {
         return;
@@ -312,7 +350,7 @@ static uint8 cd_flood_fill(
 
     while (head < tail)
     {
-        const uint16 packed = s_bfs_queue[head++];
+        const CdPixelIndex packed = s_bfs_queue[head++];
         const uint16 x = cd_unpack_x(packed);
         const uint16 y = cd_unpack_y(packed);
 
@@ -410,7 +448,7 @@ static void cd_extract_bottom_contact(
     int base_y = (int)stats->ymax;
     uint32 sum_x = 0u;
     uint32 count = 0u;
-    uint8 band;
+    uint16 band;
 
     for (y = (int)stats->ymax; y >= (int)stats->ymin; --y)
     {
@@ -497,7 +535,29 @@ static void cd_store_blob(
     }
 }
 
-static void cd_scan_components(ColorDetectionResult *result)
+/* Queue still contains the last component, so painting needs no extra mask. */
+static void cd_paint_component(
+    const CdBlobStats *stats, CdLabel label,
+    uint8 preview[SCC8660_H][SCC8660_W][3])
+{
+    uint32 n;
+    uint16 x, y;
+    if (preview == 0) return;
+    for (n = 0u; n < stats->area; ++n)
+        memcpy(preview[cd_unpack_y(s_bfs_queue[n])][cd_unpack_x(s_bfs_queue[n])],
+               g_color_detection_preview_rgb[label - 1u], 3u);
+    for (x = stats->xmin; x <= stats->xmax; ++x) {
+        memset(preview[stats->ymin][x], 255, 3u);
+        memset(preview[stats->ymax][x], 255, 3u);
+    }
+    for (y = stats->ymin; y <= stats->ymax; ++y) {
+        memset(preview[y][stats->xmin], 255, 3u);
+        memset(preview[y][stats->xmax], 255, 3u);
+    }
+}
+
+static void cd_scan_components(
+    ColorDetectionResult *result, uint8 preview[SCC8660_H][SCC8660_W][3])
 {
     uint16 y;
     uint16 x;
@@ -507,7 +567,7 @@ static void cd_scan_components(ColorDetectionResult *result)
          ++y)
     {
         for (x = COLOR_DETECTION_ROI_X_MIN;
-             x <= COLOR_DETECTION_ROI_X_MAX;
+             x < COLOR_DETECTION_ROI_X_END;
              ++x)
         {
             const CdLabel label = s_label_map[y][x];
@@ -539,6 +599,9 @@ static void cd_scan_components(ColorDetectionResult *result)
                     continue;
                 }
 
+                if (result->colours[label - 1u].count >= COLOR_DETECTION_MAX_CONES)
+                    continue;
+                cd_paint_component(&stats, label, preview);
                 cd_store_blob(
                     label,
                     &stats,
@@ -612,7 +675,7 @@ static void cd_detect_large_white_region(
          ++y)
     {
         for (x = COLOR_DETECTION_ROI_X_MIN;
-             x <= COLOR_DETECTION_ROI_X_MAX;
+             x < COLOR_DETECTION_ROI_X_END;
              ++x)
         {
             uint8 r;
@@ -633,7 +696,7 @@ static void cd_detect_large_white_region(
          ++y)
     {
         for (x = COLOR_DETECTION_ROI_X_MIN;
-             x <= COLOR_DETECTION_ROI_X_MAX;
+             x < COLOR_DETECTION_ROI_X_END;
              ++x)
         {
             if (s_label_map[y][x] == CD_LABEL_WHITE)
@@ -664,15 +727,40 @@ uint32 ColorDetection_ProcessImage(
     const uint16 image[SCC8660_H][SCC8660_W],
     ColorDetectionResult *result)
 {
+    return ColorDetection_ProcessImageWithPreview(image, result, 0);
+}
+
+const ColorDetectionThreshold *ColorDetection_GetThreshold(uint16 color_index)
+{
+    return color_index < COLOR_DETECTION_COLOR_COUNT ?
+           &g_color_detection_thresholds[color_index] : 0;
+}
+
+uint8 ColorDetection_Rgb565ToHsl(uint16 raw, uint8 *h, uint8 *s, uint8 *l)
+{
+    uint8 r, g, b;
+    if (h == 0 || s == 0 || l == 0) return 0u;
+    cd_rgb565_to_rgb888(raw, &r, &g, &b);
+    cd_rgb_to_hsl240(r, g, b, h, s, l);
+    return 1u;
+}
+
+uint32 ColorDetection_ProcessImageWithPreview(
+    const uint16 image[SCC8660_H][SCC8660_W],
+    ColorDetectionResult *result,
+    uint8 preview[SCC8660_H][SCC8660_W][3])
+{
     if ((image == 0) || (result == 0))
     {
         return 0u;
     }
 
     memset(result, 0, sizeof(*result));
+    if (preview != 0)
+        memset(preview, 0, (size_t)SCC8660_H * SCC8660_W * 3u);
 
     cd_build_label_map(image, result);
-    cd_scan_components(result);
+    cd_scan_components(result, preview);
     cd_detect_large_white_region(image, result);
 
     {

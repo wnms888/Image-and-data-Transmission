@@ -23,6 +23,7 @@ HEADER_SIZE = 22
 MAX_PAYLOAD_SIZE = 4 * 1024 * 1024
 MAX_TEXT_PAYLOAD_SIZE = 64 * 1024
 PIXEL_FLAG_RGB565_MSB_FIRST = 0x01
+PIXEL_FLAG_BGR565 = 0x04
 PACKET_FLAG_PAYLOAD_CRC_PRESENT = 0x02
 # Keep in lockstep with WIFI_IMAGE_TRANSFER_ENABLE_PAYLOAD_CRC.  Only packets
 # that satisfy this requirement are returned to the GUI.
@@ -348,9 +349,11 @@ def _looks_like_numeric_list(data_text: str) -> bool:
 
 
 def resolve_pixel_layout(layout: str, packet_flags: int = 0) -> str:
-    """Resolve automatic layout from the packet's RGB565 byte-order flag."""
+    """Resolve automatic layout from byte-order (bit 0) and BGR (bit 2)."""
 
     if layout == PIXEL_LAYOUT_AUTO:
+        if packet_flags & PIXEL_FLAG_BGR565:
+            return PIXEL_LAYOUT_BGR565_MSB if packet_flags & PIXEL_FLAG_RGB565_MSB_FIRST else PIXEL_LAYOUT_BGR565_LSB
         return (
             PIXEL_LAYOUT_RGB565_MSB
             if packet_flags & PIXEL_FLAG_RGB565_MSB_FIRST

@@ -2,6 +2,10 @@
 #define CODE_WIFI_IMAGE_TRANSFER_H_
 
 #include "zf_common_headfile.h"
+#include "TC4ImageProcessingConfig.h"
+#if TC4_IMAGE_PROCESSING_CONFIG_VERSION != 2u
+#error Export and replace the complete v2 TC4ImageProcessingConfig.h
+#endif
 
 /* Select exactly one image-transfer behaviour at build time. */
 #define WIFI_IMAGE_TRANSFER_DISABLED             (0u)
@@ -11,7 +15,7 @@
 #define WIFI_IMAGE_TRANSFER_MODE WIFI_IMAGE_TRANSFER_AFTER_PROCESSING
 #endif
 
-/* PC mobile-hotspot and SeekFree Assistant endpoint. */
+/* PC mobile-hotspot and IMGT monitor endpoint (not the old image-only tool). */
 #ifndef WIFI_IMAGE_TRANSFER_SSID
 #define WIFI_IMAGE_TRANSFER_SSID                 "BRDJC"
 #endif
@@ -48,7 +52,7 @@
  *   10..11 image height (zero for text)
  *   12     pixel format (2 = RGB565, zero for text)
  *   13     flags: bit 0 = RGB565 payload is high-byte first;
- *           bit 1 = payload CRC-32 is present
+ *           bit 1 = payload CRC-32 is present; bit 2 = BGR565 channel order
  *   14..15 packet sequence
  *   16..17 CRC-16/CCITT of bytes 0..15
  *   18..21 payload CRC-32/IEEE (required by the PC receiver)
@@ -60,13 +64,17 @@
 #define WIFI_IMAGE_TRANSFER_RGB565_FORMAT          (2u)
 #define WIFI_IMAGE_TRANSFER_FLAG_RGB565_MSB_FIRST  (0x01u)
 #define WIFI_IMAGE_TRANSFER_FLAG_PAYLOAD_CRC        (0x02u)
+#define WIFI_IMAGE_TRANSFER_FLAG_BGR565             (0x04u)
 
-/* SCC8660 emits the RGB565 high byte first on its pixel bus.  This switch
- * describes the byte sequence already present in image memory; it does not
- * alter or copy the image payload.  Set to 0 only when the supplied image
- * buffer is known to be native little-endian RGB565. */
+/* Single source of truth: detector and WiFi describe the SAME raw memory.
+ * Change only the exported configuration header, never a separate override.
+ * These flags do not convert/reorder pixels or change camera driver settings. */
+#if defined(WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST) && \
+    WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST != TC4_CFG_COLOR_SWAP_RGB565_BYTES
+#error Byte-order override conflicts with TC4ImageProcessingConfig.h
+#endif
 #ifndef WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST
-#define WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST       (1u)
+#define WIFI_IMAGE_TRANSFER_RGB565_MSB_FIRST TC4_CFG_COLOR_SWAP_RGB565_BYTES
 #endif
 
 /* Maximum one printf line staged before its terminating '\n'. */
@@ -130,14 +138,19 @@ void WifiImageTransfer_Init(void);
  * telemetry work.  This is a synchronous, maximum-throughput call: the source
  * image must remain valid until it returns, and CPU0 waits until every SPI
  * fragment has been submitted to the WiFi module.
+ * Only ORIGINAL SCC8660_W x SCC8660_H frames of SCC8660_IMAGE_SIZE bytes are
+ * accepted; NULL/wrong-size/not-ready calls are ignored. Do not pass RGB888
+ * colour masks or differently sized IPM output. This call sends, not processes.
  */
 void WifiImageTransfer_SubmitRgb565Frame(const uint16 *image, uint32 image_bytes);
 
 /*
  * Queue an already assembled debug line for a type-2 packet.  It is normally
  * called through WifiImageTransfer_PutChar() by the printf redirection hook.
- * The call performs no SPI transaction and is therefore safe while WiFi is
- * busy.  WifiImageTransfer_Service() performs the actual transmission.
+ * The call performs no SPI transaction. Returns 1 for a non-empty input,
+ * NOT an acknowledgement of delivery; a full FIFO drops newest bytes.
+ * The FIFO is not multi-producer synchronized: serialize logging on CPU0;
+ * do not concurrently call from multiple cores or interrupt writers.
  */
 uint8 WifiImageTransfer_SubmitText(const char *text, uint16 text_length);
 
@@ -158,8 +171,10 @@ void WifiImageTransfer_WriteLogBytes(const char *data, uint32 length);
  * main-loop iteration; it returns immediately while the WiFi SPI bus is busy.
  */
 void WifiImageTransfer_Service(void);
+/* Compatibility alias for ONE Service iteration, not a blocking drain. */
 void WifiImageTransfer_FlushLog(void);
 
+/* 1 after a successful connection, otherwise 0; no probing is performed. */
 uint8 WifiImageTransfer_IsReady(void);
 
 #endif /* CODE_WIFI_IMAGE_TRANSFER_H_ */

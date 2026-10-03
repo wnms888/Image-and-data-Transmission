@@ -92,7 +92,7 @@ class ImageProcessingTests(unittest.TestCase):
             maximum_components=9,
         )
         generated = render_embedded_processing_config(ipm, colour)
-        self.assertIn('#define TC4_IPM_VIEW_NEAR_X                       (0.35f)', generated)
+        self.assertIn('#define TC4_IPM_VIEW_NEAR_X                       (0.35)', generated)
         self.assertIn('#define TC4_IPM_VIEW_OUTPUT_WIDTH                 (200u)', generated)
         self.assertIn('#define TC4_CFG_COLOR_ROI_LEFT_PERCENT            (5u)', generated)
         self.assertIn('#define TC4_CFG_COLOR_MAX_CONES                   (9u)', generated)
@@ -117,9 +117,9 @@ class ImageProcessingTests(unittest.TestCase):
         header = embedded_header.read_text(encoding='utf-8')
         checked_in = dict(pattern.findall(header))
         self.assertEqual(checked_in, generated)
-        table_pattern = r'#define TC4_CFG_COLOR_THRESHOLDS[^/]+?(?=/\* Embedded-only)'
-        self.assertEqual(re.search(table_pattern, header).group().strip(),
-                         re.search(table_pattern, exported).group().strip())
+        self.assertEqual(header, exported)
+        self.assertEqual((root / 'HostApp/imgt_processing_config_embedded_config.h').read_text(encoding='utf-8'),
+                         exported)
 
     def test_hover_mapping_handles_letterbox_and_scaling(self):
         rect = (10, 20, 8, 6)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import colorsys
 import json
 import math
@@ -19,7 +19,7 @@ import tempfile
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from protocol import fit_size, resize_rgb888_nearest, rgb888_to_ppm
+from protocol import fit_size, resize_rgb888_nearest, rgb888_to_ppm, resolve_pixel_layout
 import theme as ui
 
 
@@ -208,6 +208,8 @@ class ColourDetectionConfig:
     roi_left_percent: int = 0
     roi_right_percent: int = 100
     maximum_components: int = 12
+    # Concrete camera-memory layout; exported to BOTH detector and WiFi header.
+    pixel_layout: str = "rgb565_msb"
 
 
 @dataclass(frozen=True)
@@ -276,9 +278,10 @@ def detect_colours(
     _validate_colour_config(config)
     cache = _label_cache if _label_cache is not None else {}
     labels = [0] * (width * height)
-    start_row = min(height, max(0, round(height * config.roi_top_percent / 100)))
-    start_column = min(width, max(0, round(width * config.roi_left_percent / 100)))
-    end_column = min(width, max(start_column, round(width * config.roi_right_percent / 100)))
+    # Integer half-up rounding and an exclusive right edge match the target.
+    start_row = (height * config.roi_top_percent + 50) // 100
+    start_column = (width * config.roi_left_percent + 50) // 100
+    end_column = (width * config.roi_right_percent + 50) // 100
     for y in range(start_row, height):
         for x in range(start_column, end_column):
             index = (y * width + x) * 3
@@ -420,12 +423,12 @@ def save_processing_config(path: str | Path, ipm: IpmConfig, colour: ColourDetec
 
 
 def _c_float(value: float) -> str:
-    """Format one finite host value as an explicitly single-precision C literal."""
+    """Round-trip Python's binary64 value: no truncation or float suffix."""
 
-    text = format(value, ".10g")
+    text = repr(float(value))
     if "." not in text and "e" not in text.lower():
         text += ".0"
-    return f"({text}f)"
+    return f"({text})"
 
 
 def _c_uint(value: int) -> str:
@@ -456,7 +459,7 @@ def render_embedded_processing_config(ipm: IpmConfig, colour: ColourDetectionCon
         "#ifndef TC4_IMAGE_PROCESSING_CONFIG_H_",
         "#define TC4_IMAGE_PROCESSING_CONFIG_H_",
         "",
-        "#define TC4_IMAGE_PROCESSING_CONFIG_VERSION       (1u)",
+        "#define TC4_IMAGE_PROCESSING_CONFIG_VERSION       (2u)",
         "",
         "/* Camera calibration. */",
         f"#define TC4_IPM_REFERENCE_WIDTH                   {_c_uint(calibration.reference_width)}",
@@ -499,7 +502,9 @@ def render_embedded_processing_config(ipm: IpmConfig, colour: ColourDetectionCon
         f"#define TC4_CFG_COLOR_ROI_RIGHT_PERCENT           {_c_uint(colour.roi_right_percent)}",
         "",
     ))
-    lines.append("/* H, S, L, area, width, height, fill and aspect for each rule. */")
+    lines.append("/* Each row: h_min, h_max, s_min, s_max, l_min, l_max,")
+    lines.append(" * area_min, area_max, width_min, height_min, fill_min_permille,")
+    lines.append(" * aspect_min_permille, aspect_max_permille. First rule wins. */")
     lines.append("#define TC4_CFG_COLOR_THRESHOLDS \\")
     for index, item in enumerate(colour.colours):
         t = item.threshold
@@ -511,9 +516,18 @@ def render_embedded_processing_config(ipm: IpmConfig, colour: ColourDetectionCon
         suffix = " \\" if index + 1 < len(colour.colours) else ""
         lines.append("    {" + ", ".join(_c_uint(value) for value in values) + "}," + suffix)
     lines.append("")
+    lines.append("/* RGB888 mask colours, in the same order as thresholds. */")
+    lines.append("#define TC4_CFG_COLOR_PREVIEW_RGB \\")
+    for index, item in enumerate(colour.colours):
+        suffix = " \\" if index + 1 < len(colour.colours) else ""
+        lines.append("    {" + ", ".join(_c_uint(value) for value in item.preview_rgb) + "}," + suffix)
+    lines.append("")
     lines.extend((
+        "/* Camera memory layout, shared with WifiImageTransfer; not a conversion. */",
+        f"#define TC4_CFG_COLOR_SWAP_RGB565_BYTES           {_c_uint(int(colour.pixel_layout.endswith('_msb')))}",
+        f"#define TC4_CFG_COLOR_BGR565                      {_c_uint(int(colour.pixel_layout.startswith('bgr')))}",
+        "",
         "/* Embedded-only safeguards, fixed in every host export. */",
-        "#define TC4_CFG_COLOR_SWAP_RGB565_BYTES           (1u)",
         "#define TC4_CFG_COLOR_BOTTOM_BAND_ROWS             (3u)",
         "#define TC4_CFG_COLOR_BOTTOM_MIN_PIXELS            (2u)",
         "#define TC4_CFG_COLOR_COPY_CAMERA_FRAME            (0u)",
@@ -581,6 +595,7 @@ def load_processing_config(path: str | Path) -> tuple[IpmConfig, ColourDetection
             roi_left_percent=int(colour_data["roi_left_percent"]),
             roi_right_percent=int(colour_data["roi_right_percent"]),
             maximum_components=int(colour_data["maximum_components"]),
+            pixel_layout=str(colour_data.get("pixel_layout", "rgb565_msb")),
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise ProcessingConfigError(f"配置内容无效：{error}") from error
@@ -627,6 +642,8 @@ def _validate_ipm_config(config: IpmConfig) -> None:
 
 
 def _validate_colour_config(config: ColourDetectionConfig) -> None:
+    if config.pixel_layout == "auto" or resolve_pixel_layout(config.pixel_layout) != config.pixel_layout:
+        raise ProcessingConfigError("导出配置必须使用明确的 RGB565/BGR565 字节序")
     if not (
         0 <= config.roi_top_percent <= 100
         and 0 <= config.roi_left_percent < config.roi_right_percent <= 100
@@ -671,6 +688,56 @@ def preview_to_source_pixel(
     return ((x - left) * width // displayed_width, (y - top) * height // displayed_height)
 
 
+def estimate_hsl_threshold(
+    rgb: bytes, width: int, height: int, rectangle: tuple[int, int, int, int],
+    base: HslThreshold,
+) -> HslThreshold:
+    """Infer a circular hue interval and S/L extrema from an ORIGINAL RGB ROI.
+
+    Rectangle uses exclusive right/bottom edges. Small margins (H 2, S/L 5)
+    allow camera noise; achromatic pixels have undefined hue and do not widen
+    a chromatic hue interval. A fully neutral sample uses the full hue range.
+    Geometry is copied unchanged. Histogram/cache bound memory to RGB565 size.
+    """
+    x0, y0, x1, y1 = rectangle
+    if len(rgb) != width * height * 3 or not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise ValueError("框选范围必须位于原始图像内且不能为空")
+    hues = set()
+    s_min = l_min = 240
+    s_max = l_max = 0
+    cache: dict[int, tuple[int, int, int]] = {}
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            offset = (y * width + x) * 3
+            r, g, b = rgb[offset], rgb[offset + 1], rgb[offset + 2]
+            key = (r << 16) | (g << 8) | b
+            hsl = cache.get(key)
+            if hsl is None:
+                hsl = rgb_to_hsl240(r, g, b)
+                if len(cache) < 65536:
+                    cache[key] = hsl
+            h, s, l = hsl
+            if s >= 12:
+                hues.add(h % 240)
+            s_min, s_max = min(s_min, s), max(s_max, s)
+            l_min, l_max = min(l_min, l), max(l_max, l)
+    h_min, h_max = 0, 240
+    if hues:
+        ordered = sorted(hues)
+        # The complement of the largest empty gap is the shortest containing arc.
+        gaps = [(ordered[(i + 1) % len(ordered)] - value) % 240
+                for i, value in enumerate(ordered)]
+        if len(ordered) == 1:
+            gaps[0] = 240
+        gap_index = max(range(len(gaps)), key=gaps.__getitem__)
+        if 240 - gaps[gap_index] + 4 < 239:
+            h_min = (ordered[(gap_index + 1) % len(ordered)] - 2) % 240
+            h_max = (ordered[gap_index] + 2) % 240
+    return replace(base, h_min=h_min, h_max=h_max,
+                   s_min=max(0, s_min - 5), s_max=min(240, s_max + 5),
+                   l_min=max(0, l_min - 5), l_max=min(240, l_max + 5))
+
+
 class _ImagePreview(ttk.Frame):
     """A canvas that keeps an RGB888 frame fitted to its own size."""
 
@@ -697,6 +764,16 @@ class _ImagePreview(ttk.Frame):
         self._probe_position: tuple[int, int] | None = None
         self._probe_text: int | None = None
         self._probe_background: int | None = None
+        self._selection_callback: Callable | None = None
+        self._selection_cancel: Callable | None = None
+        self._selection_start: tuple[int, int] | None = None
+        self._selection_end: tuple[int, int] | None = None
+        self._selection_item: int | None = None
+        self.canvas.bind("<ButtonPress-1>", self._selection_press)
+        self.canvas.bind("<B1-Motion>", self._selection_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._selection_release)
+        self.canvas.bind("<Escape>", lambda _event: self.cancel_selection())
+        self.canvas.bind("<Button-3>", lambda _event: self.cancel_selection())
         self.pixel_info_var = tk.StringVar(value="悬停原图像素查看 HSL（0–240）")
         self.bind("<Destroy>", self._on_destroy, add="+")
 
@@ -732,6 +809,10 @@ class _ImagePreview(ttk.Frame):
     def _update_probe(self) -> None:
         if not self._probe_enabled:
             return
+        if self._selection_callback is not None:
+            self.pixel_info_var.set("拖框取样 · Esc / 右键取消")
+            self.canvas.itemconfigure("pixel_probe", state="hidden")
+            return
         source = None
         if self._probe_position is not None and self._rgb:
             source = preview_to_source_pixel(*self._probe_position, self._display_rectangle,
@@ -766,8 +847,80 @@ class _ImagePreview(ttk.Frame):
         self.canvas.tag_raise("pixel_probe")
 
     def set_image(self, rgb: bytes, width: int, height: int) -> None:
+        if self._selection_callback is not None:
+            return  # Freeze the exact displayed frame, not a newer receive buffer.
         self._rgb, self._width, self._height = rgb, width, height
         self._render()
+
+    def begin_selection(self, callback: Callable, on_cancel: Callable) -> bool:
+        if not self._rgb or min(self._width, self._height) <= 0:
+            return False
+        self.cancel_selection()
+        self._selection_callback, self._selection_cancel = callback, on_cancel
+        self.canvas.configure(cursor="crosshair")
+        self.canvas.focus_set()
+        self._update_probe()
+        return True
+
+    def cancel_selection(self, notify: bool = True) -> None:
+        on_cancel = self._selection_cancel
+        self._selection_callback = self._selection_cancel = None
+        self._selection_start = self._selection_end = None
+        self.canvas.delete("threshold_selection")
+        self._selection_item = None
+        self.canvas.configure(cursor="")
+        self._update_probe()
+        if notify and on_cancel is not None:
+            on_cancel()
+
+    def _selection_source(self, x: int, y: int, clamp: bool = False) -> tuple[int, int] | None:
+        left, top, width, height = self._display_rectangle
+        if clamp and width > 0 and height > 0:
+            x = max(left, min(x, left + width - 1))
+            y = max(top, min(y, top + height - 1))
+        return preview_to_source_pixel(x, y, self._display_rectangle, self._width, self._height)
+
+    def _selection_press(self, event: tk.Event) -> None:
+        if self._selection_callback is None:
+            return
+        source = self._selection_source(event.x, event.y)
+        if source is not None:
+            self._selection_start = self._selection_end = source
+            self._draw_selection()
+
+    def _selection_motion(self, event: tk.Event) -> None:
+        if self._selection_start is not None:
+            self._selection_end = self._selection_source(event.x, event.y, clamp=True)
+            self._draw_selection()
+
+    def _draw_selection(self) -> None:
+        if self._selection_start is None or self._selection_end is None:
+            return
+        x0, y0 = self._selection_start
+        x1, y1 = self._selection_end
+        left, top, width, height = self._display_rectangle
+        bounds = (left + min(x0, x1) * width / self._width,
+                  top + min(y0, y1) * height / self._height,
+                  left + (max(x0, x1) + 1) * width / self._width,
+                  top + (max(y0, y1) + 1) * height / self._height)
+        if self._selection_item is None:
+            self._selection_item = self.canvas.create_rectangle(
+                *bounds, outline=ui.BLUE_HOVER, width=2, dash=(5, 3), tags="threshold_selection")
+        else:
+            self.canvas.coords(self._selection_item, *bounds)
+        self.canvas.tag_raise("threshold_selection")
+
+    def _selection_release(self, event: tk.Event) -> None:
+        if self._selection_start is None or self._selection_callback is None:
+            return
+        self._selection_motion(event)
+        x0, y0 = self._selection_start
+        x1, y1 = self._selection_end
+        rectangle = (min(x0, x1), min(y0, y1), max(x0, x1) + 1, max(y0, y1) + 1)
+        callback = self._selection_callback
+        frame = self._rgb, self._width, self._height
+        self.cancel_selection(notify=False)
+        callback(*frame, rectangle)
 
     def _render(self) -> None:
         if not self._rgb or self._width <= 0 or self._height <= 0:
@@ -796,6 +949,7 @@ class _ImagePreview(ttk.Frame):
         top = max(0, (self.canvas.winfo_height() - target_height) // 2)
         self.canvas.coords(self._item, left, top)
         self._display_rectangle = (left, top, target_width, target_height)
+        self._draw_selection()  # Keep a drag box aligned when the window resizes.
         # Refresh values for a stationary pointer when the camera frame changes.
         self._update_probe()
 
@@ -1158,10 +1312,15 @@ class ColourDetectionPane(_DualImagePane):
         super().__init__(parent, "实时原图", "颜色检测结果")
         self.original_preview.enable_hsl_probe()
         self._detector = ColourDetector()
+        self._pixel_layout = "rgb565_msb"
         self._on_change = on_change
         self._frame: tuple[bytes, int, int] | None = None
         self.info_var = tk.StringVar(value="等待图像")
         self._colour_rows: list[dict] = []
+        self._selection_target: dict | None = None
+        self._auto_threshold_future: Future | None = None
+        self._auto_threshold_poll: str | None = None
+        self._auto_threshold_target: dict | None = None
         self.colour_count_var = tk.StringVar()
         # Colour actions stay visible above the scrolling threshold editors.
         self._control_canvas.grid_configure(row=1)
@@ -1258,11 +1417,20 @@ class ColourDetectionPane(_DualImagePane):
             self._add_compact_field(group, label, variable, 0, 240, 1 + index // 2, (index % 2) * 2)
         self._add_compact_field(group, "最小面积(px)", row["geometry"]["area_min"], 1, 65535, 4, 0)
         self._add_compact_field(group, "最大面积(px)", row["geometry"]["area_max"], 1, 65535, 4, 2)
-        ttk.Button(group, text="高级阈值…", command=lambda item=row: self._open_geometry_editor(item)).grid(
-            row=5, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=(4, 0)
+        buttons = ttk.Frame(group, style="Card.TFrame")
+        buttons.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        for column in range(3):
+            buttons.columnconfigure(column, weight=1)
+        ttk.Button(buttons, text="高级阈值…", command=lambda item=row: self._open_geometry_editor(item)).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
         )
-        ttk.Button(group, text="移除", command=lambda item=row: self._remove_colour(item)).grid(
-            row=5, column=2, columnspan=2, sticky="ew", pady=(4, 0)
+        row["auto_button"] = ttk.Button(
+            buttons, text="框选自动阈值", command=lambda item=row: self._start_auto_threshold(item))
+        row["auto_button"].grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        if self._auto_threshold_future is not None:
+            row["auto_button"].state(["disabled"])
+        ttk.Button(buttons, text="移除", command=lambda item=row: self._remove_colour(item)).grid(
+            row=0, column=2, sticky="ew"
         )
         self._bind_control_wheel(group)
         self._update_colour_actions()
@@ -1281,6 +1449,8 @@ class ColourDetectionPane(_DualImagePane):
         if len(self._colour_rows) == 1:
             messagebox.showwarning("颜色检测", "至少保留一种颜色。", parent=self)
             return
+        if self._selection_target is row:
+            self.original_preview.cancel_selection()
         row["group"].destroy()
         self._colour_rows.remove(row)
         for index, item in enumerate(self._colour_rows):
@@ -1337,10 +1507,12 @@ class ColourDetectionPane(_DualImagePane):
             roi_left_percent=int(self.roi_left_var.get()),
             roi_right_percent=int(self.roi_right_var.get()),
             maximum_components=int(self.maximum_components_var.get()),
+            pixel_layout=self._pixel_layout,
         )
 
     def apply_config(self, config: ColourDetectionConfig) -> None:
         _validate_colour_config(config)
+        self.original_preview.cancel_selection()
         for row in self._colour_rows:
             row["group"].destroy()
         self._colour_rows.clear()
@@ -1350,6 +1522,7 @@ class ColourDetectionPane(_DualImagePane):
         self.roi_left_var.set(config.roi_left_percent)
         self.roi_right_var.set(config.roi_right_percent)
         self.maximum_components_var.set(config.maximum_components)
+        self._pixel_layout = config.pixel_layout
         self._on_change()
 
     @staticmethod
@@ -1439,11 +1612,95 @@ class ColourDetectionPane(_DualImagePane):
     def _show_processing_result(
         self, rgb: bytes, width: int, height: int, config: ColourDetectionConfig, result: ColourDetectionOutput,
     ) -> None:
+        if self.original_preview._selection_callback is not None:
+            return  # Keep BOTH previews paired to the frozen selection frame.
         self.original_preview.set_image(rgb, width, height)
         self.result_preview.set_image(result.image, width, height)
-        self.info_var.set(" · ".join(
-            f"{colour.name} {count} 个" for colour, count in zip(config.colours, result.component_counts)
-        ))
+        if self._auto_threshold_future is None:
+            self.info_var.set(" · ".join(
+                f"{colour.name} {count} 个" for colour, count in zip(config.colours, result.component_counts)
+            ))
+
+    def _start_auto_threshold(self, row: dict) -> None:
+        if self._processing_closed or self._auto_threshold_future is not None:
+            return
+        if not self.original_preview._rgb:
+            messagebox.showinfo("框选自动阈值", "请先接收图像并打开颜色检测页面。", parent=self)
+            return
+        # All six HSL fields are replaced; even an empty/unfinished HSL edit
+        # can be repaired by sampling. Geometry entries are never read/changed.
+        base = HslThreshold(0, 240, 0, 240, 0, 240)
+        self.original_preview.cancel_selection()
+        self._selection_target = row
+        row["auto_button"].configure(text="正在框选…")
+        self.original_preview.begin_selection(
+            lambda rgb, width, height, rectangle: self._estimate_selected_threshold(
+                row, base, rgb, width, height, rectangle),
+            self._cancel_auto_threshold_selection)
+        self.info_var.set(f"请在原图框选「{row['name'].get()}」色块；Esc / 右键取消")
+
+    def _cancel_auto_threshold_selection(self) -> None:
+        row = self._selection_target
+        self._selection_target = None
+        if row is not None and row["auto_button"].winfo_exists():
+            row["auto_button"].configure(text="框选自动阈值")
+        self._last_request = None
+        self.info_var.set("已取消框选")
+        if not self._processing_closed:
+            self._on_change()
+
+    def _estimate_selected_threshold(
+        self, row: dict, base: HslThreshold, rgb: bytes, width: int, height: int,
+        rectangle: tuple[int, int, int, int],
+    ) -> None:
+        self._selection_target = None
+        row["auto_button"].configure(text="框选自动阈值")
+        self._auto_threshold_target = row
+        for item in self._colour_rows:
+            item["auto_button"].state(["disabled"])
+        self.info_var.set("正在后台计算框选区域的 HSL 阈值…")
+        self._auto_threshold_future = self._executor.submit(
+            estimate_hsl_threshold, rgb, width, height, rectangle, base)
+        self._auto_threshold_poll = self.after(15, self._poll_auto_threshold)
+        self._last_request = None
+        self._on_change()
+
+    def _poll_auto_threshold(self) -> None:
+        self._auto_threshold_poll = None
+        if self._processing_closed or self._auto_threshold_future is None:
+            return
+        if not self._auto_threshold_future.done():
+            self._auto_threshold_poll = self.after(15, self._poll_auto_threshold)
+            return
+        future, row = self._auto_threshold_future, self._auto_threshold_target
+        self._auto_threshold_future = self._auto_threshold_target = None
+        for item in self._colour_rows:
+            item["auto_button"].state(["!disabled"])
+        if not any(item is row for item in self._colour_rows):
+            return  # Colour was removed/imported while the worker was running.
+        try:
+            threshold = future.result()
+            for variable, key in zip(row["hsl"],
+                                     ("h_min", "h_max", "s_min", "s_max", "l_min", "l_max")):
+                variable.set(getattr(threshold, key))
+            self.info_var.set(f"已填写「{row['name'].get()}」的 HSL 阈值（面积等参数不变）")
+            self._last_request = None
+            self._on_change()
+        except Exception as error:
+            self.info_var.set(f"自动阈值失败：{error}")
+
+    def shutdown_processing(self) -> None:
+        if self._processing_closed:
+            return
+        if self.original_preview.canvas.winfo_exists():
+            self.original_preview.cancel_selection(notify=False)
+        if self._auto_threshold_poll is not None:
+            self.after_cancel(self._auto_threshold_poll)
+            self._auto_threshold_poll = None
+        if self._auto_threshold_future is not None:
+            self._auto_threshold_future.cancel()
+            self._auto_threshold_future = None
+        super().shutdown_processing()
 
     def _show_processing_error(self, error: Exception) -> None:
         self.info_var.set(f"参数无效：{error}")
